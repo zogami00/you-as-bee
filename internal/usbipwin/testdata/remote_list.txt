@@ -1,0 +1,9 @@
+# SYNTHESISED fixture. Not captured from a real usbip-win2 installation; the
+# shape is modelled on `usbip list -r <host>`.
+Exportable USB devices
+======================
+ - 192.168.1.42
+      1-1.4: Microsoft Corp. : Xbox Wireless Controller (045e:02ea)
+           : /sys/devices/platform/soc/usb1/1-1/1-1.4
+      1-2: Realtek Semiconductor Corp. : Bluetooth Radio (0bda:c820)
+           : /sys/devices/platform/soc/usb1/1-1/1-2

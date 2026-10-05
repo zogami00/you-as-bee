@@ -1,0 +1,4 @@
+# SYNTHESISED fixture. Not captured from a real usbip-win2 installation; the
+# shape is modelled on `usbip port` with nothing attached.
+Imported USB devices
+====================

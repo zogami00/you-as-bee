@@ -25,6 +25,10 @@ internal/identity   stable device keys and pin matching / ambiguity detection
 internal/usbiphost  usbip-host bind/unbind sequence (build-tagged, injectable)
 internal/agent      reconcile loop, backoff and quarantine circuit breaker
 internal/api        management HTTP API (:3241), SSE events and typed client
+internal/client     Windows supervisor: auto-attach, backoff, SSE consumer
+internal/usbipwin   usbip-win2 discovery, invocation and output parsing
+internal/elevate    UAC elevation check and runas relaunch
+internal/tray       Windows notification-area UI (no-op off Windows)
 internal/sdnotify   systemd sd_notify (READY/WATCHDOG/STATUS), stdlib only
 internal/version    build-time version metadata (set via -ldflags -X)
 deploy/pi           systemd units, modprobe blacklist and udev rule
@@ -35,11 +39,32 @@ scripts/check.ps1   local validation gate (gofmt, vet, test, build, cross-build)
 Ports: the management API listens on **3241**. USB/IP uses **3240** and is
 deliberately not configurable.
 
+## Windows client (yab)
+
+`yab` reads `%ProgramData%\you-as-bee\client.json`, locates `usbip.exe` (config
+`usbip_path`, then the registry, then `%ProgramFiles%\USBip`, then `PATH`) and
+supervises the configured `auto_attach` devices, re-attaching them over USB/IP
+and reacting to the agent's SSE event stream.
+
+```
+yab tray                       default when run with no arguments
+yab list | devices             list devices on the configured servers
+yab attach <device> | --all    attach (requires elevation)
+yab detach <device> | --all    detach (requires elevation)
+yab status                     servers, reachability and attached ports
+yab doctor                     usbip, driver, elevation, Secure Boot, agents
+yab install | uninstall        copy to %ProgramFiles%, ACL, logon task
+```
+
+`yab doctor` only reports; it never changes test signing, Secure Boot or the
+driver.
+
 ## Building and checking
 
 Requires Go 1.27 and, on Windows, Windows PowerShell 5.1. The project builds
-with `CGO_ENABLED=0` and depends only on the Go standard library (the sole
-third-party module, `fyne.io/systray`, is added later and is Windows-only).
+with `CGO_ENABLED=0`. The only third-party dependencies are `fyne.io/systray`
+and `golang.org/x/sys`, both confined to the Windows `yab` build (plus
+`godbus/dbus` as an indirect Linux-only requirement of systray).
 
 ```powershell
 # Cross-build dist/yab-windows-amd64.exe, dist/yabd-linux-arm64,

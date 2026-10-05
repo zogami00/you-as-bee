@@ -7,10 +7,13 @@ depends on the components below.
 
 | Module | License | Used by | Notes |
 | --- | --- | --- | --- |
-| `fyne.io/systray` | BSD-3-Clause | `yab` (Windows client) only | The single third-party Go module. Compiled into the Windows client for the system-tray icon. Added by a later milestone; the foundation itself uses the Go standard library only. |
+| `fyne.io/systray` | BSD-3-Clause | `yab` (Windows client) only | System-tray icon and menu. Pure Go on Windows; the `CGO_ENABLED=0` Windows build is verified. |
+| `golang.org/x/sys` | BSD-3-Clause | `yab` (Windows client) only | Windows syscalls: process-token elevation, `ShellExecuteW` and the registry. |
+| `github.com/godbus/dbus/v5` | BSD-2-Clause | indirect, via `fyne.io/systray` | Pulled in by systray's Linux backend. It is not compiled into any Windows build; `GOOS=linux yab` does not import systray either. |
 
 `yabd` (the Raspberry Pi agent) is built with `CGO_ENABLED=0` and, like the
-foundation code, links no third-party Go modules.
+foundation code, links no third-party Go modules. The third-party modules above
+are reachable only from `cmd/yab` on Windows.
 
 ## External programs invoked at runtime (not linked)
 
