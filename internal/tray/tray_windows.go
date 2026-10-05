@@ -33,7 +33,7 @@ func onReady(ctx context.Context, c Controller) {
 
 	for _, d := range c.Devices() {
 		parent := systray.AddMenuItem(fmt.Sprintf("%s (%s)", d.Name, d.Status), "")
-		line := parent.AddSubMenuItem("status: "+d.Status, "")
+		line := parent.AddSubMenuItem(statusText(d), "")
 		line.Disable()
 		toggle := parent.AddSubMenuItem(toggleLabel(d), "")
 		pins = append(pins, d.Pin)
@@ -59,7 +59,7 @@ func onReady(ctx context.Context, c Controller) {
 		}()
 	}
 
-	quit := systray.AddMenuItem("Quit", "")
+	quit := systray.AddMenuItem("Quit (devices stay attached)", "")
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -116,7 +116,7 @@ func refresh(ctx context.Context, c Controller, status *systray.MenuItem, pins [
 				if !ok {
 					continue
 				}
-				lines[i].SetTitle("status: " + d.Status)
+				lines[i].SetTitle(statusText(d))
 				toggles[i].SetTitle(toggleLabel(d))
 			}
 		}
@@ -128,4 +128,17 @@ func toggleLabel(d Device) string {
 		return "Detach " + d.Pin
 	}
 	return "Attach " + d.Pin
+}
+
+// statusText renders the live status line: state, and the pause reason or the
+// last attach error when there is one. Both used to be dropped silently.
+func statusText(d Device) string {
+	s := "status: " + d.Status
+	if d.Paused && d.PauseReason != "" {
+		s += " (" + d.PauseReason + ")"
+	}
+	if d.LastError != "" {
+		s += " - " + d.LastError
+	}
+	return s
 }

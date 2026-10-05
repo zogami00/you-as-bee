@@ -70,6 +70,8 @@ func doInstall(ctx context.Context, r execx.Runner) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
+	// Stop a running tray before copying: a locked yab.exe cannot be replaced.
+	stopClient(ctx, r)
 	if !strings.EqualFold(exe, target) {
 		if err := copyFile(exe, target); err != nil {
 			return fmt.Errorf("copy binary: %w", err)
@@ -89,22 +91,52 @@ func doInstall(ctx context.Context, r execx.Runner) error {
 		return fmt.Errorf("icacls: %w: %s", err, strings.TrimSpace(se))
 	}
 
-	taskCommand := fmt.Sprintf(`"%s" tray`, target)
-	if _, se, err := r.Run(ctx, "schtasks", "/Create",
-		"/TN", taskName,
-		"/TR", taskCommand,
-		"/SC", "ONLOGON",
-		"/RL", "HIGHEST",
-		"/F",
-	); err != nil {
-		return fmt.Errorf("schtasks: %w: %s", err, strings.TrimSpace(se))
+	if err := registerTask(ctx, r, target); err != nil {
+		return err
 	}
 	return nil
+}
+
+// registerTask creates the highest-privilege logon task through the
+// ScheduledTasks module rather than `schtasks /TR`, which cannot express the
+// settings below and whose argument quoting fails on PowerShell 5.1. The
+// settings stop Windows from killing the task after 72 hours or refusing to
+// start it on battery, both of which would silently drop the supervisor.
+func registerTask(ctx context.Context, r execx.Runner, exe string) error {
+	script := fmt.Sprintf(
+		"$a = New-ScheduledTaskAction -Execute %s -Argument 'tray'; "+
+			"$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 "+
+			"-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; "+
+			"Register-ScheduledTask -TaskName %s -Action $a -Settings $s "+
+			"-RunLevel Highest -Force | Out-Null",
+		psSingleQuote(exe), psSingleQuote(taskName))
+	if _, se, err := r.Run(ctx, "powershell.exe",
+		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+		"-Command", script); err != nil {
+		return fmt.Errorf("register task: %w: %s", err, strings.TrimSpace(se))
+	}
+	return nil
+}
+
+// psSingleQuote quotes s as a PowerShell single-quoted literal.
+func psSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// stopClient ends the logon task and any running yab.exe other than this
+// process, so install can overwrite the binary and uninstall can remove it.
+// An in-place install/uninstall must not kill itself mid-run.
+func stopClient(ctx context.Context, r execx.Runner) {
+	_, _, _ = r.Run(ctx, "schtasks", "/End", "/TN", taskName)
+	_, _, _ = r.Run(ctx, "taskkill", "/IM", "yab.exe", "/F",
+		"/FI", fmt.Sprintf("PID ne %d", os.Getpid()))
 }
 
 // doUninstall removes the logon task and the installed binary directory. The
 // config in %ProgramData% is deliberately left in place.
 func doUninstall(ctx context.Context, r execx.Runner) error {
+	// Stop the tray first: Remove-Item fails on a locked yab.exe.
+	stopClient(ctx, r)
 	if _, se, err := r.Run(ctx, "schtasks", "/Delete", "/TN", taskName, "/F"); err != nil {
 		// A missing task is fine; report any other failure.
 		if !strings.Contains(strings.ToLower(se), "cannot find") {

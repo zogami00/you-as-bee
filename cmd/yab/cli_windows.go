@@ -244,7 +244,7 @@ func attachTargets(cfg config.ClientConfig, all bool, args []string, stderr io.W
 	if all {
 		out := make([]string, 0, len(cfg.AutoAttach))
 		for _, a := range cfg.AutoAttach {
-			out = append(out, a.Device)
+			out = append(out, a.Server+"/"+a.Device)
 		}
 		if len(out) == 0 {
 			fmt.Fprintln(stderr, "yab: no auto_attach devices configured")
@@ -272,7 +272,7 @@ func attachDevice(ctx context.Context, cfg config.ClientConfig, tool *usbipwin.T
 	}
 	cli := api.NewClient(apiBase(cfg, s), s.Token, cfg.CommandTimeout.Duration())
 
-	dev, err := cli.Device(ctx, device)
+	dev, err := cli.Device(ctx, a.Device)
 	if err != nil {
 		return fmt.Errorf("%s: %w", s.Name, err)
 	}
@@ -283,7 +283,7 @@ func attachDevice(ctx context.Context, cfg config.ClientConfig, tool *usbipwin.T
 		if err := cli.Export(ctx, dev.Pin, false); err != nil {
 			return fmt.Errorf("export: %w", err)
 		}
-		if refreshed, rerr := cli.Device(ctx, device); rerr == nil {
+		if refreshed, rerr := cli.Device(ctx, a.Device); rerr == nil {
 			dev = refreshed
 		}
 	}
@@ -291,9 +291,10 @@ func attachDevice(ctx context.Context, cfg config.ClientConfig, tool *usbipwin.T
 		return fmt.Errorf("%s: device has no bus id", s.Name)
 	}
 
+	hosts := client.HostSet(ctx, s.Host)
 	if ports, perr := tool.Port(ctx); perr == nil {
 		for _, p := range ports {
-			if p.BusID == dev.BusID && strings.EqualFold(p.Host, s.Host) {
+			if p.BusID == dev.BusID && client.HostMatches(hosts, p.Host) {
 				return nil // already attached
 			}
 		}
@@ -307,7 +308,7 @@ func attachDevice(ctx context.Context, cfg config.ClientConfig, tool *usbipwin.T
 		return nil // attach reported success; confirmation unavailable
 	}
 	for _, p := range ports {
-		if p.BusID == dev.BusID && strings.EqualFold(p.Host, s.Host) {
+		if p.BusID == dev.BusID && client.HostMatches(hosts, p.Host) {
 			return nil
 		}
 	}
@@ -325,33 +326,34 @@ func detachDevice(ctx context.Context, cfg config.ClientConfig, tool *usbipwin.T
 		return fmt.Errorf("unknown server %q", a.Server)
 	}
 
-	var busid string
+	// Require the bus id: without it we would have to guess which port to
+	// detach, and the API being unreachable would turn "detach one device"
+	// into "detach every port on this server".
 	cli := api.NewClient(apiBase(cfg, s), s.Token, cfg.CommandTimeout.Duration())
-	if dev, err := cli.Device(ctx, device); err == nil {
-		busid = dev.BusID
+	dev, derr := cli.Device(ctx, a.Device)
+	if derr != nil {
+		return fmt.Errorf("%s: cannot determine bus id: %w", s.Name, derr)
+	}
+	busid := dev.BusID
+	if busid == "" {
+		return fmt.Errorf("%s: device %q has no bus id", s.Name, device)
 	}
 
+	hosts := client.HostSet(ctx, s.Host)
 	ports, err := tool.Port(ctx)
 	if err != nil {
 		return err
 	}
-	detached := 0
 	for _, p := range ports {
-		if !strings.EqualFold(p.Host, s.Host) {
-			continue
-		}
-		if busid != "" && p.BusID != busid {
+		if p.BusID != busid || !client.HostMatches(hosts, p.Host) {
 			continue
 		}
 		if derr := tool.Detach(ctx, p.Port); derr != nil {
 			return derr
 		}
-		detached++
+		return nil
 	}
-	if detached == 0 {
-		return fmt.Errorf("no attached port for %q on %s", device, s.Name)
-	}
-	return nil
+	return fmt.Errorf("no attached port for %q on %s", device, s.Name)
 }
 
 // doctorReport is the JSON shape of `yab doctor`.

@@ -136,6 +136,71 @@ PI$ sudo reboot
 - [ ] `yabd status` shows the pins exported again.
 - [ ] The Windows client re-attaches automatically without manual help.
 
+## 12. Capture real usbip output and diff it against the fixtures
+
+The parser in `internal/usbipwin` is tested only against **synthesised**
+fixtures (`internal/usbipwin/testdata/*.txt`); none has been confirmed against a
+real `usbip-win2` build. This is the highest-risk unverified item.
+
+```powershell
+PC> usbip --version
+PC> usbip port | Out-File -Encoding ascii usbip-port-empty.txt
+PC> yab attach --all
+PC> usbip port | Out-File -Encoding ascii usbip-port-real.txt
+PC> usbip list -r raspberrypi.local | Out-File -Encoding ascii usbip-list-real.txt
+```
+
+- [ ] Capture all three outputs and attach them to the sign-off.
+- [ ] Compare `usbip-port-empty.txt` with `port_empty.txt` (or with truly empty
+      output): with nothing attached, `yab status` must show the pins idle, not
+      `backoff` (the parser now treats "no ports" as an empty success).
+- [ ] Compare `usbip-port-real.txt` with `port_one.txt` / `port_two.txt`: the
+      `Port NN:` header, the `-> usbip://...` URI, the `(vid:pid)` pair and the
+      bus id.
+- [ ] Note whether the `usbip://` URI prints the **configured hostname** or the
+      **resolved IP**. The client resolves the configured host and compares
+      against both, but confirm the attach is confirmed rather than looping
+      through `backoff`.
+- [ ] Compare `usbip-list-real.txt` with `remote_list.txt`.
+- [ ] If any real sample differs from the fixtures, add it to
+      `internal/usbipwin/testdata` and adjust the parser and its tests before
+      sign-off. If you use IPv6, confirm a bracketed URI
+      (`usbip://[fe80::1]:3240/1-1.4`) parses to host `fe80::1`.
+
+## 13. Windows sleep and resume
+
+```text
+# suspend the PC, wait, resume it
+```
+
+- [ ] After resume the tray and supervisor are still running and the ports
+      re-attach within a reconcile interval (`yab status` shows them attached).
+- [ ] If they do not, the tray status line and `yab status` show the last
+      attach error rather than only `backoff`.
+
+## 14. Tray Quit leaves ports attached (documented)
+
+- [ ] Quit the tray from its menu. The menu item reads
+      "Quit (devices stay attached)".
+- [ ] After quitting, `usbip port` still lists the ports and the controller and
+      Bluetooth device still work: quitting does **not** detach.
+- [ ] `yab detach --all` (elevated) detaches them; document that this is the
+      way to release the devices.
+
+## 15. Logon task survives past 72 hours
+
+```powershell
+PC> (Get-ScheduledTask -TaskName you-as-bee-client).Settings |
+      Format-List ExecutionTimeLimit,DisallowStartIfOnBatteries,StopIfGoingOnBatteries,StartWhenAvailable
+```
+
+- [ ] `ExecutionTimeLimit` is `PT0S` (unlimited),
+      `DisallowStartIfOnBatteries` is `False`,
+      `StopIfGoingOnBatteries` is `False`, and `StartWhenAvailable` is `True`.
+- [ ] Leave the machine logged on for more than 72 hours (or set the clock
+      forward and confirm the task is still `Running`) with no tray loss and no
+      unsupervised detached/attached drift.
+
 ## Sign-off
 
 Record for each item: pass/fail, board (4B or Zero 2 W), connection (wired or

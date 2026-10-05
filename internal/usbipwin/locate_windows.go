@@ -13,7 +13,13 @@ import (
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/zogami00/you-as-bee/internal/elevate"
 )
+
+// elevated reports whether the process is running elevated. It is a variable so
+// tests can drive the user-writable-path policy without a real UAC token.
+var elevated = elevate.IsElevated
 
 // ErrToolNotFound is returned when usbip.exe cannot be located. Its message
 // tells the user how to fix it.
@@ -36,12 +42,16 @@ func Locate(explicit string) (string, error) {
 		if !fileExists(p) {
 			return "", fmt.Errorf("%w (usbip_path %q does not exist)", ErrToolNotFound, p)
 		}
-		warnIfUserWritable(p)
+		if err := checkUserWritable(p, true); err != nil {
+			return "", err
+		}
 		return p, nil
 	}
 
 	if p, ok := fromRegistry(); ok {
-		warnIfUserWritable(p)
+		if err := checkUserWritable(p, false); err != nil {
+			return "", err
+		}
 		return p, nil
 	}
 
@@ -49,14 +59,18 @@ func Locate(explicit string) (string, error) {
 		if root := os.Getenv(env); root != "" {
 			p := filepath.Join(root, "USBip", "usbip.exe")
 			if fileExists(p) {
-				warnIfUserWritable(p)
+				if err := checkUserWritable(p, false); err != nil {
+					return "", err
+				}
 				return p, nil
 			}
 		}
 	}
 
 	if p, err := exec.LookPath("usbip.exe"); err == nil {
-		warnIfUserWritable(p)
+		if err := checkUserWritable(p, false); err != nil {
+			return "", err
+		}
 		return p, nil
 	}
 	return "", ErrToolNotFound
@@ -100,8 +114,9 @@ func fromRegistry() (string, bool) {
 	return "", false
 }
 
-// warnIfUserWritable logs a warning when p is inside a user-writable tree.
-func warnIfUserWritable(p string) {
+// userWritableRoot returns the user-writable root (USERPROFILE or
+// LOCALAPPDATA) that contains p, or "" when p is outside both.
+func userWritableRoot(p string) string {
 	for _, env := range []string{"USERPROFILE", "LOCALAPPDATA"} {
 		root := os.Getenv(env)
 		if root == "" {
@@ -109,12 +124,38 @@ func warnIfUserWritable(p string) {
 		}
 		rel, err := filepath.Rel(root, p)
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, `..\`) && !strings.HasPrefix(rel, "../") {
-			slog.Warn("usbip.exe resolved from a user-writable location; "+
-				"an elevated process should not run a user-writable binary",
-				"path", p, "root", root)
-			return
+			return root
 		}
 	}
+	return ""
+}
+
+// checkUserWritable enforces the policy for a user-writable usbip.exe.
+//
+// An explicit usbip_path is the operator's opt-in, so it is only warned about.
+// A path discovered from the registry, Program Files or PATH is refused when
+// the process is elevated: running a user-writable binary as administrator is a
+// privilege-escalation vector. When not elevated the same path is only warned
+// about, because there is no privilege to escalate.
+func checkUserWritable(p string, explicit bool) error {
+	root := userWritableRoot(p)
+	if root == "" {
+		return nil
+	}
+	if explicit {
+		slog.Warn("usbip.exe explicitly configured from a user-writable location; "+
+			"an elevated process should not run a user-writable binary",
+			"path", p, "root", root)
+		return nil
+	}
+	if elevated() {
+		return fmt.Errorf("%w: %q resolved under %s, which is user-writable; "+
+			"set usbip_path explicitly to accept this risk", ErrToolNotFound, p, root)
+	}
+	slog.Warn("usbip.exe resolved from a user-writable location; "+
+		"an elevated process should not run a user-writable binary",
+		"path", p, "root", root)
+	return nil
 }
 
 func fileExists(name string) bool {

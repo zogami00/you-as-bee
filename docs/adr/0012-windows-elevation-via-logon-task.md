@@ -14,10 +14,16 @@ tray belongs.
 ## Decision
 
 Register a **logon Scheduled Task with highest privileges** that runs
-`yab.exe tray` for the current user (`schtasks /SC ONLOGON /RL HIGHEST`). The
-task is created by `yab install` and by `deploy/windows/install.ps1`. When the
-tray is started without elevation, it offers a "Restart as administrator" item
-that relaunches via the UAC `runas` verb.
+`yab.exe tray` for the current user. The task is created by `yab install` and by
+`deploy/windows/install.ps1` using `Register-ScheduledTask` (an `AtLogOn`
+trigger, `RunLevel Highest`) with `New-ScheduledTaskSettingsSet
+-ExecutionTimeLimit 0 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+-StartWhenAvailable`, so Windows neither kills the supervisor after 72 hours nor
+refuses to start it on battery. `schtasks /TR` cannot express those settings and
+its argument quoting fails on PowerShell 5.1 for a path containing spaces. When
+the tray is started without elevation, it offers a "Restart as administrator"
+item that relaunches via the UAC `runas` verb and then exits the original
+process.
 
 ## Consequences
 

@@ -31,6 +31,21 @@ func TestClassifyFailureUnrelated(t *testing.T) {
 	}
 }
 
+// An ordinary "device not found" attach failure must not be reported as a
+// missing vhci driver.
+func TestClassifyFailureDeviceNotFoundIsNotDriverMissing(t *testing.T) {
+	for _, stderr := range []string{
+		"error: device not found",
+		"device not found on remote host",
+		"remote device not found",
+	} {
+		err := ClassifyFailure(context.Background(), execx.NewFakeRunner(), "usbip.exe", 1, stderr)
+		if errors.Is(err, ErrDriverMissing) || errors.Is(err, ErrDriverBlocked) {
+			t.Errorf("stderr %q: want a generic error, got %v", stderr, err)
+		}
+	}
+}
+
 func TestClassifyFailureDriverMissing(t *testing.T) {
 	fr := execx.NewFakeRunner().OnName(pnputilPath(), execx.FakeResponse{
 		Stdout: "Instance ID:                USB\\VID_1234&PID_5678\r\n" +
@@ -64,6 +79,31 @@ func TestHasUSBIPProblem52IgnoresOtherDevices(t *testing.T) {
 		"Problem Code:               0\r\n\r\n"
 	if hasUSBIPProblem52(out) {
 		t.Fatal("want false: the usbip device has no problem and the problem device is not usbip")
+	}
+}
+
+func TestAttachRejectsOptionLikeHostBeforeRunning(t *testing.T) {
+	for _, host := range []string{"", "-r", "-", "--help"} {
+		fr := execx.NewFakeRunner()
+		tool := New(`C:\fake\usbip.exe`, fr)
+		err := tool.Attach(context.Background(), host, "1-1.4")
+		if !errors.Is(err, ErrInvalidHost) {
+			t.Errorf("host %q: want ErrInvalidHost, got %v", host, err)
+		}
+		if fr.CallCount() != 0 {
+			t.Errorf("host %q: runner was invoked %d times", host, fr.CallCount())
+		}
+	}
+}
+
+func TestListRemoteRejectsOptionLikeHost(t *testing.T) {
+	fr := execx.NewFakeRunner()
+	tool := New(`C:\fake\usbip.exe`, fr)
+	if _, err := tool.ListRemote(context.Background(), "-x"); !errors.Is(err, ErrInvalidHost) {
+		t.Fatalf("want ErrInvalidHost, got %v", err)
+	}
+	if fr.CallCount() != 0 {
+		t.Fatalf("runner was invoked %d times", fr.CallCount())
 	}
 }
 

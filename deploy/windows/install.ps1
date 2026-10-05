@@ -80,6 +80,16 @@ function Fail([string]$Message) {
     throw ("install: {0}" -f $Message)
 }
 
+# Stop the logon task and the tray process so a locked yab.exe can be replaced.
+function Stop-YabClient {
+    if (Get-ScheduledTask -TaskName 'you-as-bee-client' -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName 'you-as-bee-client' -ErrorAction SilentlyContinue
+    }
+    Get-Process -Name 'yab' -ErrorAction SilentlyContinue | ForEach-Object {
+        Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # --- admin gate (skipped for a dry run, which changes nothing) ---------------
 
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -214,6 +224,7 @@ if ($needCopy) {
             New-Item -ItemType Directory -Path $installDir -Force | Out-Null
         }
     }
+    if (-not $DryRun) { Stop-YabClient }
     if ($PSCmdlet.ShouldProcess($targetExe, 'Copy yab.exe')) {
         Copy-Item -LiteralPath $SourcePath -Destination $targetExe -Force
     }
@@ -233,6 +244,14 @@ if (-not (Test-Path -LiteralPath $dataDir)) {
     if ($PSCmdlet.ShouldProcess($dataDir, 'Create directory')) {
         New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
     }
+}
+
+# Restrict the directory BEFORE writing client.json: the file holds the bearer
+# token, and the inherited ACL leaves a window where Users could read it.
+if ($PSCmdlet.ShouldProcess($dataDir, 'Restrict ACL to Administrators and SYSTEM')) {
+    & icacls $dataDir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' /grant:r '*S-1-5-18:(OI)(CI)F' | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail ("icacls failed (exit {0})" -f $LASTEXITCODE) }
+    Write-Ok 'ACL restricted to Administrators and SYSTEM'
 }
 
 $writeConfig = (-not (Test-Path -LiteralPath $configPath)) -or $Force
@@ -258,18 +277,11 @@ if ($writeConfig) {
     Write-Ok 'client.json already present (use -Force to overwrite)'
 }
 
-if ($PSCmdlet.ShouldProcess($dataDir, 'Restrict ACL to Administrators and SYSTEM')) {
-    & icacls $dataDir /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' /grant:r '*S-1-5-18:(OI)(CI)F' | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail ("icacls failed (exit {0})" -f $LASTEXITCODE) }
-    Write-Ok 'ACL restricted to Administrators and SYSTEM'
-}
-
 # --- scheduled task ----------------------------------------------------------
 
 Write-Step 'logon task'
 
 $taskName = 'you-as-bee-client'
-$taskCommand = ('"{0}" tray' -f $targetExe)
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 $register = $true
 if ($existing -and -not $Force) {
@@ -277,9 +289,20 @@ if ($existing -and -not $Force) {
     Write-Ok 'task already registered (use -Force to re-register)'
 }
 if ($register) {
+    # Register-ScheduledTask (not `schtasks /TR`) for two reasons:
+    #   1. schtasks /TR cannot express the settings below, and its argument
+    #      quoting fails on PowerShell 5.1 for a path containing spaces;
+    #   2. the settings stop Windows killing the task after 72 hours or
+    #      refusing to start it on battery.
     if ($PSCmdlet.ShouldProcess($taskName, 'Register logon Scheduled Task')) {
-        & schtasks /Create /TN $taskName /TR $taskCommand /SC ONLOGON /RL HIGHEST /F | Out-Null
-        if ($LASTEXITCODE -ne 0) { Fail ("schtasks /Create failed (exit {0})" -f $LASTEXITCODE) }
+        $action = New-ScheduledTaskAction -Execute $targetExe -Argument 'tray'
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+            -Settings $settings -RunLevel Highest -Force | Out-Null
+    } else {
+        Write-Info ("would register '{0}' as: {1} tray" -f $taskName, $targetExe)
     }
     Write-Ok ("registered task '{0}'" -f $taskName)
 }

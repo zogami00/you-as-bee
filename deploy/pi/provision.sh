@@ -99,8 +99,10 @@ done
 # shellcheck disable=SC1091
 . /etc/os-release
 case "${VERSION_CODENAME:-}" in
-bookworm) ;;
-*) die "expected Raspberry Pi OS bookworm, found '${PRETTY_NAME:-unknown}'" ;;
+bookworm | trixie | bullseye) ;;
+*)
+	warn "expected a Debian/Raspberry Pi OS bookworm-era release, found '${PRETTY_NAME:-unknown}'; continuing anyway"
+	;;
 esac
 case "${ID:-}${ID_LIKE:-}" in
 *debian* | *raspbian*) ;;
@@ -295,6 +297,9 @@ EOF
 	fi
 
 	if [ "$FW_WRITTEN" -eq 1 ] || ! nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+		# Replace, do not append: a re-run after a CIDR change must not leave
+		# the previous allow rules in place.
+		nft delete table inet "$NFT_TABLE" 2>/dev/null || true
 		nft -f "$NFT_FILE"
 		CHANGED=1
 	fi

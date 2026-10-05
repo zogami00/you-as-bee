@@ -45,7 +45,7 @@ func (m *Manager) watchEvents(ctx context.Context, s config.ServerConfig) {
 		backoff = initial
 
 		for ev := range events {
-			m.HandleEvent(ev)
+			m.HandleEvent(s.Name, ev)
 		}
 
 		m.markSSEDown(s.Name)

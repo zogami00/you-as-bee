@@ -45,23 +45,28 @@ func cmdTray(args []string, stdout, stderr io.Writer) int {
 
 	go func() { _ = m.Run(ctx) }()
 
-	tray.Run(ctx, &trayController{m: m})
+	tray.Run(ctx, &trayController{m: m, cancel: cancel})
 	return 0
 }
 
 // trayController adapts *client.Manager to tray.Controller.
-type trayController struct{ m *client.Manager }
+type trayController struct {
+	m      *client.Manager
+	cancel context.CancelFunc
+}
 
 func (t *trayController) Devices() []tray.Device {
 	statuses := t.m.Status()
 	out := make([]tray.Device, 0, len(statuses))
 	for _, ps := range statuses {
 		out = append(out, tray.Device{
-			Pin:      ps.Pin,
-			Name:     ps.Pin,
-			Status:   ps.State,
-			Attached: ps.State == client.StateAttached,
-			Paused:   ps.Paused,
+			Pin:         ps.Pin,
+			Name:        ps.Pin,
+			Status:      ps.State,
+			Attached:    ps.State == client.StateAttached,
+			Paused:      ps.Paused,
+			LastError:   ps.LastError,
+			PauseReason: ps.PauseReason,
 		})
 	}
 	return out
@@ -78,5 +83,13 @@ func (t *trayController) Detach(pin string) error {
 func (t *trayController) Elevated() bool { return elevate.IsElevated() }
 
 func (t *trayController) RestartElevated() error {
-	return elevate.RelaunchElevated(os.Args[1:])
+	if err := elevate.RelaunchElevated(os.Args[1:]); err != nil {
+		return err
+	}
+	// The elevated relaunch owns the tray now. Without this the original
+	// process kept running, leaving two tray icons and two supervisors.
+	if t.cancel != nil {
+		t.cancel()
+	}
+	return nil
 }

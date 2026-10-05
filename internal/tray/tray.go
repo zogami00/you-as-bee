@@ -17,6 +17,10 @@ type Device struct {
 	Attached bool
 	// Paused reports whether auto-attach is user-paused.
 	Paused bool
+	// LastError is the most recent attach/confirm failure, if any.
+	LastError string
+	// PauseReason explains why auto-attach is paused.
+	PauseReason string
 }
 
 // Controller is the supervisor surface the tray drives. It is implemented by

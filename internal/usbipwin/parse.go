@@ -39,8 +39,10 @@ type RemoteDevice struct {
 
 var (
 	portBlockRe = regexp.MustCompile(`^Port\s+(\d+):`)
-	portURLRe   = regexp.MustCompile(`usbip://([^/:]+):(\d+)/(\S+)`)
-	vidpidRe    = regexp.MustCompile(`\(([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\)`)
+	// portURLRe accepts both a plain host and a bracketed IPv6 literal, e.g.
+	// usbip://192.168.1.42:3240/1-1.4 and usbip://[fe80::1]:3240/1-1.4.
+	portURLRe = regexp.MustCompile(`usbip://(\[[^\]]+\]|[^/:]+):(\d+)/(\S+)`)
+	vidpidRe  = regexp.MustCompile(`\(([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\)`)
 
 	remoteBusRe = regexp.MustCompile(`^\s*([0-9]+-[0-9]+(?:\.[0-9]+)*):\s*(.*)$`)
 )
@@ -70,8 +72,8 @@ func hasMarker(out string) bool {
 // block; within a block the usbip:// URI yields host, remote port and bus id,
 // and a 4:4 hex pair yields VID/PID. Unknown lines are skipped, never fatal.
 //
-// Recognised output with no ports returns an empty, non-nil slice. Output that
-// contains neither a port block nor a recognised header returns ErrUnrecognised.
+// Output with no port blocks (a clean machine, or a recognised empty header)
+// returns an empty, non-nil slice and a nil error.
 func ParsePort(out string) ([]PortEntry, error) {
 	entries := []PortEntry{}
 	var cur *PortEntry
@@ -90,7 +92,7 @@ func ParsePort(out string) ([]PortEntry, error) {
 			continue
 		}
 		if m := portURLRe.FindStringSubmatch(line); m != nil {
-			cur.Host = m[1]
+			cur.Host = unbracketHost(m[1])
 			if n, err := strconv.Atoi(m[2]); err == nil {
 				cur.RemotePort = n
 			}
@@ -103,12 +105,23 @@ func ParsePort(out string) ([]PortEntry, error) {
 	}
 
 	if len(entries) == 0 {
-		if hasMarker(out) {
-			return entries, nil
-		}
-		return nil, fmt.Errorf("%w: usbip port produced no port blocks", ErrUnrecognised)
+		// `usbip port` exits zero with no port blocks when nothing is attached.
+		// That is a successful empty result, not a parse failure: a clean
+		// machine must not be treated as "usbip is broken" and backed off
+		// forever. (Failures to run usbip surface as an error from Tool.Port
+		// before parsing.)
+		return entries, nil
 	}
 	return entries, nil
+}
+
+// unbracketHost strips the square brackets from an IPv6 literal in a usbip
+// URI so host matching compares the same text the config uses.
+func unbracketHost(host string) string {
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		return host[1 : len(host)-1]
+	}
+	return host
 }
 
 // ParseRemote parses the output of `usbip list -r <host>`. Each line of the

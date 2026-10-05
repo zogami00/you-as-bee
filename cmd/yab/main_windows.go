@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/zogami00/you-as-bee/internal/client"
 	"github.com/zogami00/you-as-bee/internal/config"
@@ -122,13 +123,40 @@ func newManager(cfg config.ClientConfig, tool *usbipwin.Tool) (*client.Manager, 
 	if tool != nil {
 		u = tool
 	}
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger, err := newLogger(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return client.New(client.Options{
 		Config: cfg,
 		USBIP:  u,
 		Log:    logger,
 		Notify: func(pin, msg string) { logger.Warn("notify", "pin", pin, "message", msg) },
 	})
+}
+
+// newLogger builds the client logger. log_file empty means discard; otherwise
+// the file is opened in append mode so a long-running tray keeps its history.
+// log_level selects the minimum level.
+func newLogger(cfg config.ClientConfig) (*slog.Logger, error) {
+	level := slog.LevelInfo
+	switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	opts := &slog.HandlerOptions{Level: level}
+	if strings.TrimSpace(cfg.LogFile) == "" {
+		return slog.New(slog.NewTextHandler(io.Discard, opts)), nil
+	}
+	f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open log_file: %w", err)
+	}
+	return slog.New(slog.NewTextHandler(f, opts)), nil
 }
 
 // requireElevated prints the required message and returns false when the
@@ -154,11 +182,28 @@ func serverByHost(cfg config.ClientConfig, name string) (config.ServerConfig, bo
 	return config.ServerConfig{}, false
 }
 
+// autoAttachFor resolves a configured auto_attach entry from either a
+// qualified "server/device" id or a bare device name. A bare name that matches
+// more than one server is ambiguous and reported as not found, so the caller
+// tells the user to qualify it.
 func autoAttachFor(cfg config.ClientConfig, device string) (config.AutoAttach, bool) {
+	server, name := "", device
+	if i := strings.Index(device, "/"); i >= 0 {
+		server, name = device[:i], device[i+1:]
+	}
+
+	matches := make([]config.AutoAttach, 0, 1)
 	for _, a := range cfg.AutoAttach {
-		if a.Device == device {
-			return a, true
+		if a.Device != name {
+			continue
 		}
+		if server != "" && a.Server != server {
+			continue
+		}
+		matches = append(matches, a)
+	}
+	if len(matches) == 1 {
+		return matches[0], true
 	}
 	return config.AutoAttach{}, false
 }

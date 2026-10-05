@@ -23,7 +23,10 @@ var (
 )
 
 var (
-	driverMissingRe = regexp.MustCompile(`(?i)vhci|cannot open|not found`)
+	// driverMissingRe must not match an ordinary per-device failure such as
+	// "device not found"; it matches only text that points at the vhci driver
+	// or service itself.
+	driverMissingRe = regexp.MustCompile(`(?i)vhci|cannot open|(?:driver|service)\b[^\n]{0,40}\bnot\s+(?:found|installed|present|running)`)
 	problem52Re     = regexp.MustCompile(`(?i)problem(?:\s+code)?\s*:?\s*52\b`)
 	usbipDeviceRe   = regexp.MustCompile(`(?i)usbip|vhci`)
 )

@@ -106,17 +106,34 @@ type fakeUSBIP struct {
 	attachErr   error
 	attachCalls []attachCall
 	detachCalls []int
+	// reportHost, when set, is written into the port entry instead of the host
+	// passed to Attach. It models usbip-win2 printing the resolved IP.
+	reportHost string
+	// onAttach, when set, runs while Attach is in flight (before the port is
+	// recorded) so a test can interleave a Pause.
+	onAttach func()
 }
 
 func (f *fakeUSBIP) Attach(_ context.Context, host, busid string) error {
+	f.mu.Lock()
+	hook := f.onAttach
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.attachCalls = append(f.attachCalls, attachCall{host, busid})
 	if f.attachErr != nil {
 		return f.attachErr
 	}
+	reported := host
+	if f.reportHost != "" {
+		reported = f.reportHost
+	}
 	f.ports = append(f.ports, usbipwin.PortEntry{
-		Port: f.nextPort, Host: host, RemotePort: 3240, BusID: busid, VID: "045e", PID: "02ea",
+		Port: f.nextPort, Host: reported, RemotePort: 3240, BusID: busid, VID: "045e", PID: "02ea",
 	})
 	f.nextPort++
 	return nil
@@ -246,6 +263,17 @@ func (h *harness) pinState(t *testing.T, pin string) *pinState {
 	ps := h.m.pins[pinKey(config.AutoAttach{Server: "pi", Device: pin})]
 	if ps == nil {
 		t.Fatalf("no pin state for %q", pin)
+	}
+	return ps
+}
+
+func (h *harness) pinByServer(t *testing.T, server, device string) *pinState {
+	t.Helper()
+	h.m.mu.Lock()
+	defer h.m.mu.Unlock()
+	ps := h.m.pins[pinKey(config.AutoAttach{Server: server, Device: device})]
+	if ps == nil {
+		t.Fatalf("no pin state for %s/%s", server, device)
 	}
 	return ps
 }
@@ -444,33 +472,48 @@ func TestResumeOnDeviceAddedEvent(t *testing.T) {
 	if err := h.m.Pause(context.Background(), "xbox"); err != nil {
 		t.Fatalf("Pause: %v", err)
 	}
-	h.m.HandleEvent(proto.Event{Type: proto.EventDeviceAdded, Device: proto.Device{Pin: "xbox", BusID: "1-1.4"}})
+	h.m.HandleEvent("pi", proto.Event{Type: proto.EventDeviceAdded, Device: proto.Device{Pin: "xbox", BusID: "1-1.4"}})
 	if h.m.IsPaused("xbox") {
 		t.Fatal("device_added should clear the pause")
 	}
 }
 
-func TestStalePortCleanedBeforeAttach(t *testing.T) {
+// M1: a same-busid vhci port belonging to a DIFFERENT server must be left
+// alone. Pi bus ids repeat across Pis, so detaching it would tear down a
+// working device on the other server.
+func TestStalePortForOtherHostIsNotDetached(t *testing.T) {
 	ts, _ := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
 	defer ts.Close()
 	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
-	// A stale vhci port for the same busid from an old host address, with a
-	// stale port number.
 	h.usbip.setPorts(usbipwin.PortEntry{Port: 7, Host: "10.9.9.9", BusID: "1-1.4", VID: "045e", PID: "02ea"})
 
 	h.reconcile(t)
 
-	found := false
 	for _, p := range h.usbip.detachCalls {
 		if p == 7 {
-			found = true
+			t.Fatalf("foreign-host port 7 was detached; detaches = %v", h.usbip.detachCalls)
 		}
-	}
-	if !found {
-		t.Fatalf("stale port 7 was not detached; detaches = %v", h.usbip.detachCalls)
 	}
 	if h.usbip.attachCount() != 1 {
 		t.Fatalf("attach count = %d, want 1", h.usbip.attachCount())
+	}
+	if len(h.usbip.ports) != 2 {
+		t.Fatalf("ports = %+v, want the foreign port and the new one", h.usbip.ports)
+	}
+}
+
+func TestDetachStaleOnlyTouchesMatchingHost(t *testing.T) {
+	ts, _ := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+	h.usbip.setPorts(
+		usbipwin.PortEntry{Port: 7, Host: "127.0.0.1", BusID: "1-1.4"},
+		usbipwin.PortEntry{Port: 8, Host: "10.9.9.9", BusID: "1-1.4"},
+	)
+	h.m.detachStale(context.Background(), map[string]bool{"127.0.0.1": true}, "1-1.4")
+
+	if h.usbip.detachCount() != 1 || h.usbip.detachCalls[0] != 7 {
+		t.Fatalf("detach calls = %v, want [7]", h.usbip.detachCalls)
 	}
 }
 
@@ -522,4 +565,176 @@ func (n *noConfirmUSBIP) Port(context.Context) ([]usbipwin.PortEntry, error) {
 }
 func (n *noConfirmUSBIP) ListRemote(context.Context, string) ([]usbipwin.RemoteDevice, error) {
 	return nil, nil
+}
+
+// twoServerConfig builds a config with two named servers that share one fake
+// agent, so pin identity can be exercised by (server, device).
+func twoServerConfig(t *testing.T, ts *httptest.Server, pairs ...config.AutoAttach) config.ClientConfig {
+	t.Helper()
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	host, portStr, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		t.Fatalf("split host: %v", err)
+	}
+	port, _ := strconv.Atoi(portStr)
+	return config.ClientConfig{
+		SchemaVersion: 1,
+		Servers: []config.ServerConfig{
+			{Name: "piA", Host: host, APIPort: port, Token: strings.Repeat("a", 64)},
+			{Name: "piB", Host: host, APIPort: port, Token: strings.Repeat("b", 64)},
+		},
+		AutoAttach:     pairs,
+		Reconnect:      config.ReconnectConfig{Initial: config.Duration(time.Second), Max: config.Duration(10 * time.Second)},
+		CommandTimeout: config.Duration(5 * time.Second),
+	}
+}
+
+// M2: an event from one server must not touch a same-named pin on another.
+func TestHandleEventScopedToServer(t *testing.T) {
+	ts, _ := newFakeAgent()
+	defer ts.Close()
+	cfg := twoServerConfig(t, ts,
+		config.AutoAttach{Server: "piA", Device: "xbox"},
+		config.AutoAttach{Server: "piB", Device: "bluetooth"},
+	)
+	h := newHarness(t, cfg)
+	psB := h.pinByServer(t, "piB", "bluetooth")
+	psB.state = StateAttached
+
+	h.m.HandleEvent("piA", proto.Event{
+		Type:   proto.EventDeviceRemoved,
+		Device: proto.Device{Pin: "bluetooth", BusID: "1-1.4"},
+	})
+
+	if psB.state != StateAttached {
+		t.Fatalf("piB state = %q; a piA event must not mark piB absent", psB.state)
+	}
+}
+
+// M2: Pause addresses (server, device), not the bare device name.
+func TestPauseIsScopedToServer(t *testing.T) {
+	ts, _ := newFakeAgent()
+	defer ts.Close()
+	cfg := twoServerConfig(t, ts,
+		config.AutoAttach{Server: "piA", Device: "bluetooth"},
+		config.AutoAttach{Server: "piB", Device: "bluetooth"},
+	)
+	h := newHarness(t, cfg)
+
+	if err := h.m.Pause(context.Background(), "piB/bluetooth"); err != nil {
+		t.Fatalf("Pause(piB/bluetooth): %v", err)
+	}
+	if !h.m.IsPaused("piB/bluetooth") {
+		t.Fatal("piB/bluetooth should be paused")
+	}
+	if h.m.IsPaused("piA/bluetooth") {
+		t.Fatal("piA/bluetooth must not be paused by the piB pause")
+	}
+}
+
+func TestPinsAreServerQualified(t *testing.T) {
+	ts, _ := newFakeAgent()
+	defer ts.Close()
+	cfg := twoServerConfig(t, ts,
+		config.AutoAttach{Server: "piA", Device: "xbox"},
+		config.AutoAttach{Server: "piB", Device: "xbox"},
+	)
+	h := newHarness(t, cfg)
+	got := h.m.Pins()
+	want := []string{"piA/xbox", "piB/xbox"}
+	if len(got) != len(want) {
+		t.Fatalf("Pins() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Pins() = %v, want %v", got, want)
+		}
+	}
+}
+
+// Backoff must be honoured while the API is down, not re-doubled every
+// ReconcileInterval by the /healthz probe.
+func TestBackoffHonouredWhileAPIDown(t *testing.T) {
+	ts, fa := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+	fa.setHealthy(false)
+
+	h.reconcile(t)
+	first := h.pinState(t, "xbox").backoff
+	h.reconcile(t)
+	second := h.pinState(t, "xbox").backoff
+
+	if first != time.Second {
+		t.Fatalf("first backoff = %s, want 1s", first)
+	}
+	if second != first {
+		t.Fatalf("backoff grew while waiting: %s -> %s", first, second)
+	}
+}
+
+// A Pause that arrives while Attach is in flight must win: the freshly
+// attached port is detached again rather than left behind a pause.
+func TestPauseDuringAttachDetaches(t *testing.T) {
+	ts, _ := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	h.usbip.onAttach = func() { close(started); <-release }
+
+	done := make(chan struct{})
+	go func() {
+		_ = h.m.Reconcile(context.Background())
+		close(done)
+	}()
+
+	<-started
+	if err := h.m.Pause(context.Background(), "pi/xbox"); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	close(release)
+	<-done
+
+	if ps := h.pinState(t, "xbox"); ps.state != StatePaused || !ps.paused {
+		t.Fatalf("state = %+v, want paused", ps)
+	}
+	if h.usbip.detachCount() == 0 {
+		t.Fatal("the port was left attached behind a pause")
+	}
+}
+
+// M6: usbip-win2 may print the resolved IP, not the configured name, so a
+// successful attach must be confirmed against the resolved address.
+func TestAttachConfirmMatchesResolvedIP(t *testing.T) {
+	ts, _ := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+	h.m.opt.ResolveHost = func(context.Context, string) []string { return []string{"10.0.0.5"} }
+	h.usbip.reportHost = "10.0.0.5"
+
+	h.reconcile(t)
+
+	if ps := h.pinState(t, "xbox"); ps.state != StateAttached {
+		t.Fatalf("state = %q, want attached: port printed the resolved IP", ps.state)
+	}
+}
+
+// M4: the last attach error is surfaced in the status the tray renders.
+func TestStatusSurfacesAttachError(t *testing.T) {
+	ts, _ := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+	h.usbip.attachErr = usbipwin.ErrDriverBlocked
+
+	h.reconcile(t)
+
+	st := h.m.Status()
+	if len(st) != 1 || st[0].LastError == "" {
+		t.Fatalf("Status() = %+v, want a surfaced attach error", st)
+	}
 }

@@ -25,6 +25,17 @@ var busIDRe = regexp.MustCompile(`^[0-9]+-[0-9]+(?:\.[0-9]+)*$`)
 // ErrInvalidBusID is returned when a bus id is not of the form "1-1.4".
 var ErrInvalidBusID = errors.New("usbipwin: invalid bus id")
 
+// ErrInvalidHost is returned when a host would be parsed by usbip.exe as an
+// option rather than a value.
+var ErrInvalidHost = errors.New("usbipwin: invalid host")
+
+// validHost rejects an empty host or one beginning with "-", which usbip.exe
+// would read as a command-line option instead of the -r argument value.
+func validHost(host string) bool {
+	host = strings.TrimSpace(host)
+	return host != "" && !strings.HasPrefix(host, "-")
+}
+
 // Tool drives one usbip.exe binary. Every command is invoked directly with an
 // argument vector; nothing is ever passed through a shell.
 type Tool struct {
@@ -51,6 +62,9 @@ func (t *Tool) run(ctx context.Context, timeout time.Duration, args ...string) (
 // Attach attaches the remote device at host/busid to a local vhci port via
 // `usbip attach -r <host> -b <busid>`.
 func (t *Tool) Attach(ctx context.Context, host, busid string) error {
+	if !validHost(host) {
+		return fmt.Errorf("%w: %q", ErrInvalidHost, host)
+	}
 	if !busIDRe.MatchString(busid) {
 		return fmt.Errorf("%w: %q", ErrInvalidBusID, busid)
 	}
@@ -88,6 +102,9 @@ func (t *Tool) Port(ctx context.Context) ([]PortEntry, error) {
 
 // ListRemote lists the devices host exports via `usbip list -r <host>`.
 func (t *Tool) ListRemote(ctx context.Context, host string) ([]RemoteDevice, error) {
+	if !validHost(host) {
+		return nil, fmt.Errorf("%w: %q", ErrInvalidHost, host)
+	}
 	stdout, stderr, err := t.run(ctx, defaultTimeout, "list", "-r", host)
 	if err != nil {
 		return nil, fmt.Errorf("usbipwin: list -r %s: %w: %s", host, err, strings.TrimSpace(stderr))

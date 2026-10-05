@@ -5,24 +5,25 @@
 
 .DESCRIPTION
     Removes the highest-privilege logon Scheduled Task and the installed
-    program directory. The client config in %ProgramData%\you-as-bee is kept
-    unless -KeepConfig is not specified. This does not remove usbip-win2 or its
-    driver.
+    program directory, stopping the running tray first so the locked yab.exe
+    can be removed. The client config in %ProgramData%\you-as-bee is kept by
+    default, matching `yab uninstall`; use -RemoveConfig to delete it too. This
+    does not remove usbip-win2 or its driver.
 
     Windows PowerShell 5.1 compatible; ASCII only. Supports -WhatIf, which can
     be used without elevation (it performs no changes).
 
-.PARAMETER KeepConfig
-    Keep %ProgramData%\you-as-bee\client.json.
+.PARAMETER RemoveConfig
+    Also remove %ProgramData%\you-as-bee (client.json and its token).
 
 .EXAMPLE
     .\uninstall.ps1
-    .\uninstall.ps1 -KeepConfig
+    .\uninstall.ps1 -RemoveConfig
     .\uninstall.ps1 -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
-    [switch]$KeepConfig
+    [switch]$RemoveConfig
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,9 +63,16 @@ Write-Step 'logon task'
 $taskName = 'you-as-bee-client'
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($existing) {
+    # Stop the running instance before deleting: its yab.exe locks the file we
+    # are about to remove.
+    if (-not $DryRun) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Get-Process -Name 'yab' -ErrorAction SilentlyContinue | ForEach-Object {
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
     if ($PSCmdlet.ShouldProcess($taskName, 'Delete Scheduled Task')) {
-        & schtasks /Delete /TN $taskName /F | Out-Null
-        if ($LASTEXITCODE -ne 0) { Fail ("schtasks /Delete failed (exit {0})" -f $LASTEXITCODE) }
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
     }
     Write-Ok 'task removed'
 } else {
@@ -90,8 +98,8 @@ if (Test-Path -LiteralPath $installDir) {
 Write-Step 'client config'
 
 $dataDir = Join-Path $env:ProgramData 'you-as-bee'
-if ($KeepConfig) {
-    Write-Ok ("kept {0} (-KeepConfig)" -f $dataDir)
+if (-not $RemoveConfig) {
+    Write-Ok ("kept {0} (use -RemoveConfig to delete it)" -f $dataDir)
 } elseif (Test-Path -LiteralPath $dataDir) {
     if ($PSCmdlet.ShouldProcess($dataDir, 'Remove directory')) {
         Remove-Item -LiteralPath $dataDir -Recurse -Force

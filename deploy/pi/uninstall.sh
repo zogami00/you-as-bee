@@ -45,6 +45,16 @@ systemctl disable --now usbipd.service 2>/dev/null || true
 
 # --- return every usbip-host device to its original driver -------------------
 
+# Remove the btusb blacklist FIRST. The kernel applies a modprobe blacklist
+# when it tries to load a module; while btusb was still blacklisted, the
+# drivers_probe below found no driver to bind and the dongle came back with no
+# driver at all.
+rm -f /etc/modprobe.d/yab-modprobe.conf
+
+# Make sure the original driver is loadable before probing, and tolerate it
+# already being loaded.
+modprobe btusb 2>/dev/null || true
+
 # A device left bound to usbip-host would disappear from the local USB bus.
 # Reboot would recover it, but do it properly now: unbind usbip-host, drop the
 # match_busid entry, then let the kernel re-probe the original driver.
@@ -62,6 +72,10 @@ if [ -d /sys/bus/usb/drivers/usbip-host ]; then
 	done
 fi
 
+# If probing did not re-bind a device (for example because it enumerated after
+# the loop), ask udev to replay the add events now that btusb is available.
+udevadm trigger --action=add --subsystem-match=usb 2>/dev/null || true
+
 # --- firewall ----------------------------------------------------------------
 
 if command -v nft >/dev/null 2>&1; then
@@ -76,7 +90,6 @@ rm -f /usr/local/bin/yabd
 rm -f /etc/systemd/system/yabd.service
 rm -f /etc/systemd/system/usbipd.service
 rm -f /etc/modules-load.d/yab.conf
-rm -f /etc/modprobe.d/yab-modprobe.conf
 rm -f /etc/udev/rules.d/90-you-as-bee.rules
 
 if [ -d /etc/udev/rules.d ]; then

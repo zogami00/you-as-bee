@@ -56,6 +56,20 @@ The supervisor:
 - distinguishes a transient drop (recent API/SSE outage: re-attach) from a
   detach performed outside usbip (pause auto-attach and notify).
 
+Pins are addressed by `(server, device)`, not by device name alone: the config
+allows the same device name on two servers, and Pi bus ids such as `1-1.4`
+repeat across Pis. Both events and attach/detach act on the server they belong
+to, and the supervisor only detaches a stale vhci port when its host resolves
+to the same server (`usbip-win2` may print the resolved IP rather than the
+configured name).
+
+Pausing is in memory only, so a restart or logon restores auto-attach. A
+`device_added` event clears a pause - including an external-detach pause - on
+the assumption that a physical re-plug is the user's intent to use the device
+again. `yab detach` (or the tray's Detach item) is required to keep a device
+detached; quitting the tray does not detach ports (see
+[troubleshooting.md](troubleshooting.md)).
+
 ## Management API role
 
 The API is control plane only. It reports device state and records intent

@@ -32,9 +32,12 @@ If the device attaches then immediately detaches and re-attaches:
 - Another driver on Windows may be racing for the device. Attach it once with
   `yab attach <device>` and watch Device Manager for the driver that loads.
 - Check `yab status` for a stale vhci port from a previous session pointing at
-  an old host address; the supervisor detaches stale ports for the same bus id
-  before re-attaching, but a manually-created port may linger. Clear it with
-  `usbip detach -p <port>`.
+  an old host address. The supervisor only detaches stale ports whose host
+  matches the server (bus ids repeat across Pis), so a port for an old host
+  address may linger; clear it with `usbip detach -p <port>`.
+- If two servers are configured and attaching one tears down the other, they
+  share a bus id: the supervisor scopes detach to the owning server, so verify
+  each server's `host` resolves to the address `usbip port` prints.
 
 ## Bluetooth is unstable over Wi-Fi
 

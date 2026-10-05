@@ -65,10 +65,13 @@ cd deploy\windows
 - reports whether `usbip.exe` was found and its version;
 - optionally verifies a `usbip-win2` archive SHA-256;
 - **reports** test-signing and Secure Boot state and changes neither;
-- copies `yab.exe` to `%ProgramFiles%\you-as-bee\yab.exe`;
+- copies `yab.exe` to `%ProgramFiles%\you-as-bee\yab.exe` (stopping a running
+  tray first so the locked binary can be replaced);
+- creates `%ProgramData%\you-as-bee` and restricts it to Administrators and
+  SYSTEM **before** writing the token-bearing config;
 - writes `%ProgramData%\you-as-bee\client.json` from `client.example.json`;
-- restricts `%ProgramData%\you-as-bee` to Administrators and SYSTEM;
-- registers a highest-privilege logon Scheduled Task running `yab.exe tray`.
+- registers a highest-privilege logon Scheduled Task running `yab.exe tray`,
+  with an unlimited execution-time limit and battery-friendly settings.
 
 It supports `-WhatIf` (safe without elevation) and is idempotent. If you omit
 `-PiHost`/`-Token`, edit the config afterwards.
@@ -103,5 +106,21 @@ Then check Windows actually sees the device:
   when you press buttons.
 
 The tray task runs at logon with highest privileges, because attaching a device
-to a vhci port requires administrator rights. Run the full
-[hardware validation checklist](hardware-validation.md).
+to a vhci port requires administrator rights. The task is registered with an
+unlimited execution-time limit, starts on battery, and `StartWhenAvailable`, so
+it is not silently killed after 72 hours.
+
+## 7. Tray, quitting and removal
+
+- The tray menu shows each pin's state and, when relevant, the last attach
+  error or the pause reason (for example "device was detached outside usbip").
+- **Quit does not detach.** "Quit (devices stay attached)" only stops the tray
+  and supervisor; the vhci ports remain and devices keep working. Use
+  `yab detach --all` (elevated) to detach them.
+- **Restart as administrator** relaunches the process through UAC and exits the
+  original one, so there is only ever one tray.
+- `yab uninstall` and `deploy\windows\uninstall.ps1` both stop the running tray
+  first and both keep `%ProgramData%\you-as-bee\client.json` by default; pass
+  `-RemoveConfig` to `uninstall.ps1` to delete it too.
+
+Run the full [hardware validation checklist](hardware-validation.md).

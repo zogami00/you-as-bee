@@ -56,7 +56,7 @@ device matches a pin and no `serial`/`port` narrows it, the device is
 | `reconnect.initial` | duration | `1s` | First backoff delay. |
 | `reconnect.max` | duration | `30s` | Backoff ceiling; must not be less than `initial`. |
 | `command_timeout` | duration | `15s` | Per-request API timeout. Must be positive. |
-| `log_file` | string | unset | Parsed and validated but not read by the runtime today; the tray has no log file. |
+| `log_file` | string | unset | When set, the client appends its log (attach failures, external-detach notifications) to this file; when empty, logging is discarded. The tray task runs as `yab.exe tray`, so use an absolute path the account can write. |
 | `log_level` | string | `info` | `debug`, `info`, `warn` or `error`. |
 
 ## Full agent example

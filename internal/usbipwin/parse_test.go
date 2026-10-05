@@ -63,16 +63,45 @@ func TestParsePortEmptyIsRecognised(t *testing.T) {
 	}
 }
 
-func TestParsePortUnrecognised(t *testing.T) {
-	_, err := ParsePort(readFixture(t, "port_unrecognised.txt"))
-	if !errors.Is(err, ErrUnrecognised) {
-		t.Fatalf("want ErrUnrecognised, got %v", err)
+// `usbip port` exits zero with no port blocks when nothing is attached; that
+// must be a successful empty result, not a parse failure that makes the
+// supervisor back off forever on a clean machine.
+func TestParsePortNoBlocksIsEmptySuccess(t *testing.T) {
+	entries, err := ParsePort(readFixture(t, "port_unrecognised.txt"))
+	if err != nil {
+		t.Fatalf("ParsePort(no blocks): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("want 0 entries, got %+v", entries)
+	}
+	if entries == nil {
+		t.Fatal("want non-nil empty slice")
 	}
 }
 
 func TestParsePortTrulyEmpty(t *testing.T) {
-	if _, err := ParsePort("   \n\n"); !errors.Is(err, ErrUnrecognised) {
-		t.Fatalf("want ErrUnrecognised for blank output, got %v", err)
+	entries, err := ParsePort("   \n\n")
+	if err != nil {
+		t.Fatalf("want empty success for blank output, got %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("want 0 entries, got %+v", entries)
+	}
+}
+
+func TestParsePortBracketedIPv6Host(t *testing.T) {
+	out := "Imported USB devices\n" +
+		"Port 00: <Port in Use>\n" +
+		"       3-1 -> usbip://[fe80::1]:3240/1-1.4\n"
+	entries, err := ParsePort(out)
+	if err != nil {
+		t.Fatalf("ParsePort: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %+v", entries)
+	}
+	if got := entries[0]; got.Host != "fe80::1" || got.BusID != "1-1.4" || got.RemotePort != 3240 {
+		t.Fatalf("unexpected entry: %+v", got)
 	}
 }
 
