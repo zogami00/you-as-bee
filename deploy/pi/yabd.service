@@ -1,0 +1,27 @@
+[Unit]
+Description=you-as-bee USB-over-LAN agent
+Documentation=https://github.com/zogami00/you-as-bee
+Wants=network-online.target usbipd.service
+After=network-online.target usbipd.service systemd-udevd.service
+# Never give up restarting: losing the agent on a headless Pi is worse than a
+# restart loop, and the device state is recovered by the reconciler.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+WatchdogSec=30
+Restart=always
+RestartSec=2
+ExecStart=/usr/local/bin/yabd run --config /etc/you-as-bee/agent.json
+User=root
+Group=root
+# Hardening. The agent must write sysfs to bind devices and reach the token and
+# state directories, and nothing else.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/sys /etc/you-as-bee /var/lib/you-as-bee
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

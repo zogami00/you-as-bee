@@ -1,0 +1,18 @@
+[Unit]
+Description=USB/IP server (usbipd)
+Documentation=man:usbipd(8)
+After=network.target
+Before=yabd.service
+
+[Service]
+Type=simple
+# The Debian usbip package ships the client and the kernel module but no
+# usbipd daemon unit, so we provide one. Load the host-side module before the
+# daemon starts serving.
+ExecStartPre=/sbin/modprobe usbip-host
+ExecStart=/usr/sbin/usbipd
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

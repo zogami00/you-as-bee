@@ -20,7 +20,14 @@ cmd/yab             Windows client — tray + CLI
 internal/config     strict, stdlib-only config loader shared by both binaries
 internal/proto      JSON API contract shared by both binaries
 internal/execx      shell-free external command runner (+ test fake)
+internal/sysfs      USB enumeration from sysfs (injectable FS, in-memory fake)
+internal/identity   stable device keys and pin matching / ambiguity detection
+internal/usbiphost  usbip-host bind/unbind sequence (build-tagged, injectable)
+internal/agent      reconcile loop, backoff and quarantine circuit breaker
+internal/api        management HTTP API (:3241), SSE events and typed client
+internal/sdnotify   systemd sd_notify (READY/WATCHDOG/STATUS), stdlib only
 internal/version    build-time version metadata (set via -ldflags -X)
+deploy/pi           systemd units, modprobe blacklist and udev rule
 scripts/build.ps1   cross-build dist/ artefacts for all three targets
 scripts/check.ps1   local validation gate (gofmt, vet, test, build, cross-build)
 ```
