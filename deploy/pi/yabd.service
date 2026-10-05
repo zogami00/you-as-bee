@@ -15,20 +15,26 @@ RestartSec=2
 ExecStart=/usr/local/bin/yabd run --config /etc/you-as-bee/agent.json
 User=root
 Group=root
-# Hardening. The agent must write sysfs to bind devices, read its config and
-# token from /etc, and have a state directory, and nothing else.
+# Hardening. The agent writes sysfs to bind devices and reads its config and
+# token from /etc, and nothing else.
 #
-# StateDirectory= and ConfigurationDirectory= make systemd create and own
-# /var/lib/you-as-bee and /etc/you-as-bee before the mount namespace is set up.
-# They must NOT be listed in ReadWritePaths= as well: ReadWritePaths= is applied
-# first and, under ProtectSystem=strict, a path there that does not already
-# exist makes the unit die with 226/NAMESPACE and crash-loop forever. Letting
-# systemd own those directories removes that ordering hazard.
+# StateDirectory=you-as-bee makes systemd create and own /var/lib/you-as-bee
+# before the mount namespace is set up. It is provisioned for future use; the
+# daemon does not write there today (nothing in the code references it). It must
+# NOT also be listed in ReadWritePaths=: ReadWritePaths= is applied first and,
+# under ProtectSystem=strict, a path there that does not already exist makes the
+# unit die with 226/NAMESPACE and crash-loop forever. Letting systemd own the
+# directory removes that ordering hazard.
+#
+# ConfigurationDirectory=you-as-bee is deliberately absent. The daemon only
+# *reads* /etc/you-as-bee/agent.json and /etc/you-as-bee/token; the sole writer
+# is `yabd config save` (cmd/yabd/cli.go:saveConfig), which runs outside this
+# unit. ProtectSystem=strict still permits reading /etc, so the token stays
+# reachable without granting write access the daemon never uses.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/sys
 StateDirectory=you-as-bee
-ConfigurationDirectory=you-as-bee
 ProtectHome=yes
 PrivateTmp=yes
 

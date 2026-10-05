@@ -90,6 +90,19 @@ sudo ./provision.sh --binary ./yabd-linux-arm64 --client-cidr 192.168.1.0/24
 It is idempotent: run it twice and the second run reports `provision: no
 changes`, without reprinting the token.
 
+If you provisioned the Pi **before** the loopback guarantee was added (an
+`agent.json` whose `allowed_clients` omits `127.0.0.0/8`, and/or an nftables
+rule whose final drop also matched `lo`), re-run provisioning once to migrate
+it:
+
+```bash
+sudo ./provision.sh            # or: scripts\deploy-pi.ps1 -HostName ...
+```
+
+It rewrites `agent.json` to include `127.0.0.0/8` and replaces the nftables
+rule with one that accepts loopback independently. This first run reports
+changes; a second run then reports `provision: no changes`.
+
 ### Why btusb is blacklisted
 
 `yab-modprobe.conf` blacklists `btusb` and `xone` so they do not claim the

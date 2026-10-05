@@ -70,6 +70,18 @@ again. `yab detach` (or the tray's Detach item) is required to keep a device
 detached; quitting the tray does not detach ports (see
 [troubleshooting.md](troubleshooting.md)).
 
+Detaching also runs `usbip attach --stop-all`, which is **global to the
+machine**: it cancels every active attach attempt the usbip-win2 driver is
+running, not only the one for the port being detached, so it can abort an
+attempt for a different server or device. It exists because an automatic retry
+started by an older `yab` (before attaches passed `--once`) lives inside the
+driver, not in a `usbip` process, and detaching the port does not stop it.
+usbip-win2 exposes no per-device cancel, and `Tool.Detach` only has the local
+port number, so the call cannot be narrowed without a wider API change. Since
+current `yab` always attaches with `--once` it starts no retries of its own, so
+in normal operation the call is a no-op; the side effect only bites when another
+usbip-win2 user or an older `yab` left a retry running.
+
 ## Management API role
 
 The API is control plane only. It reports device state and records intent

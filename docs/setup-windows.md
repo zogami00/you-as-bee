@@ -5,8 +5,12 @@ Pi so they appear as real local USB devices.
 
 ## 1. Install usbip-win2 and its driver
 
-Install a `usbip-win2` release (the upstream project ships `usbip.exe` and the
-`vhci` driver) and make sure `usbip.exe` is reachable. `yab` looks for it in
+Install a `usbip-win2` release **at least 0.9.8.0** (the upstream project ships
+`usbip.exe` and the `vhci` driver) and make sure `usbip.exe` is reachable.
+`--receive-mode`, which every attach passes, exists only from 0.9.8.0; v0.9.7.7
+has `--once` but not `--receive-mode`, and attach against it fails permanently
+with a generic `usbipwin: usbip exited N`. `yab doctor` reports the version it
+finds and warns when it is older or unrecognised. `yab` looks for `usbip.exe` in
 this order:
 
 1. `usbip_path` from `client.json`;

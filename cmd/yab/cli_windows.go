@@ -358,15 +358,16 @@ func detachDevice(ctx context.Context, cfg config.ClientConfig, tool *usbipwin.T
 
 // doctorReport is the JSON shape of `yab doctor`.
 type doctorReport struct {
-	UsbipPath      string                `json:"usbip_path"`
-	UsbipFound     bool                  `json:"usbip_found"`
-	UsbipVersion   string                `json:"usbip_version,omitempty"`
-	DriverPresent  bool                  `json:"driver_present"`
-	DriverUnsigned bool                  `json:"driver_unsigned"`
-	Elevated       bool                  `json:"elevated"`
-	TestSigning    string                `json:"test_signing"`
-	SecureBoot     string                `json:"secure_boot"`
-	Servers        []client.ServerStatus `json:"servers"`
+	UsbipPath           string                `json:"usbip_path"`
+	UsbipFound          bool                  `json:"usbip_found"`
+	UsbipVersion        string                `json:"usbip_version,omitempty"`
+	UsbipVersionWarning string                `json:"usbip_version_warning,omitempty"`
+	DriverPresent       bool                  `json:"driver_present"`
+	DriverUnsigned      bool                  `json:"driver_unsigned"`
+	Elevated            bool                  `json:"elevated"`
+	TestSigning         string                `json:"test_signing"`
+	SecureBoot          string                `json:"secure_boot"`
+	Servers             []client.ServerStatus `json:"servers"`
 }
 
 func cmdDoctor(args []string, stdout, stderr io.Writer) int {
@@ -394,6 +395,7 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 		rep.UsbipFound = true
 		rep.UsbipPath = path
 		rep.UsbipVersion = usbipVersion(ctx, runner, path)
+		rep.UsbipVersionWarning = usbipVersionWarning(rep.UsbipVersion)
 		rep.DriverPresent, rep.DriverUnsigned = usbipwin.DriverStatus(ctx, runner, path)
 	}
 	rep.Elevated = elevate.IsElevated()
@@ -410,6 +412,11 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "usbip.exe:      %s\n", displayPath(rep))
 	fmt.Fprintf(stdout, "usbip version:  %s\n", orUnknown(rep.UsbipVersion))
+	if rep.UsbipVersionWarning != "" {
+		// A warning, never a failure: doctor still exits 0 so an unattended
+		// check is not broken by an unrecognised version string.
+		fmt.Fprintf(stderr, "yab doctor: warning: %s\n", rep.UsbipVersionWarning)
+	}
 	fmt.Fprintf(stdout, "driver present: %v\n", rep.DriverPresent)
 	fmt.Fprintf(stdout, "driver signed:  %s\n", signedLabel(rep))
 	fmt.Fprintf(stdout, "elevated:       %v\n", rep.Elevated)
@@ -454,6 +461,25 @@ func usbipVersion(ctx context.Context, r execx.Runner, path string) string {
 				return firstLine(text)
 			}
 		}
+	}
+	return ""
+}
+
+// usbipVersionWarning returns a human-readable warning when the detected
+// usbip.exe is older than usbipwin.MinimumVersion, or when its version cannot
+// be determined. Every attach passes --receive-mode, which only exists from
+// usbip-win2 0.9.8.0, so an older binary fails permanently with a generic
+// "usbipwin: usbip exited N". This is advisory only; doctor must not fail on an
+// unrecognised version string.
+func usbipVersionWarning(version string) string {
+	v, ok := usbipwin.ParseVersion(version)
+	if !ok {
+		return fmt.Sprintf("could not determine usbip.exe version; attach needs usbip-win2 >= %s (--receive-mode)",
+			usbipwin.MinimumVersion)
+	}
+	if !v.AtLeast(usbipwin.MinimumVersion) {
+		return fmt.Sprintf("usbip.exe %s is older than the required usbip-win2 >= %s; attach passes --receive-mode and will fail",
+			v, usbipwin.MinimumVersion)
 	}
 	return ""
 }

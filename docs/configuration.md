@@ -42,8 +42,11 @@ device matches a pin and no `serial`/`port` narrows it, the device is
 
 `127.0.0.0/8` is included in the default `allowed_clients` so the on-Pi CLI
 (`yabd status`, `export`, `unexport`, `reset`) can reach the agent at
-`http://127.0.0.1:3241`. If you replace the list, keep a loopback range or those
-commands get `403 forbidden`.
+`http://127.0.0.1:3241`. `provision.sh` always prepends `127.0.0.0/8` to
+whatever `--client-cidr` list you give it, and the nftables rule accepts
+loopback independently of the allowlist, so the CLI keeps working even with a
+restrictive CIDR. If you edit `agent.json` by hand instead of re-running
+`provision.sh`, keep a loopback range or those commands get `403 forbidden`.
 
 ## Client (`yab`)
 
@@ -60,7 +63,7 @@ commands get `403 forbidden`.
 | `reconnect.initial` | duration | `1s` | First backoff delay. |
 | `reconnect.max` | duration | `30s` | Backoff ceiling; must not be less than `initial`. |
 | `command_timeout` | duration | `15s` | Per-request API timeout. Must be positive. |
-| `receive_mode` | string | `low-latency` | usbip-win2 attach receive mode: `low-latency` or `zero-copy`. `zero-copy` is usbip-win2's own default and can flood Windows with device-change events and USB stalls against some devices; `low-latency` is the default here. |
+| `receive_mode` | string | `low-latency` | usbip-win2 attach receive mode: `low-latency` or `zero-copy`. `zero-copy` is usbip-win2's own default and can flood Windows with device-change events and USB stalls against some devices; `low-latency` is the default here. Requires **usbip-win2 >= 0.9.8.0**: the `--receive-mode` flag does not exist in v0.9.7.7 or earlier, where attach fails with `usbipwin: usbip exited N`. |
 | `log_file` | string | unset | When set, the client appends its log (attach failures, external-detach notifications) to this file; when empty, logging is discarded. The tray task runs as `yab.exe tray`, so use an absolute path the account can write. |
 | `log_level` | string | `info` | `debug`, `info`, `warn` or `error`. |
 

@@ -57,8 +57,11 @@ usage() {
 Usage: sudo ./provision.sh [options]
 
   --client-cidr CIDR[,CIDR...]  CIDR allowlist for the management API and the
-                                nftables rule (default: keep the example's
-                                RFC1918 ranges).
+                                nftables rule (default: the example's RFC1918
+                                ranges). 127.0.0.0/8 is always added, because
+                                the on-Pi CLI (yabd status/export) connects
+                                from loopback; the firewall also accepts
+                                loopback independently of this list.
   --binary PATH                 yabd binary to install (default: ./yabd-linux-arm64).
   --example PATH                agent config template (default: ./agent.example.json).
   --no-firewall                 do not install or apply the nftables rule.
@@ -252,41 +255,64 @@ if [ ! -s "$TOKEN_FILE" ]; then
 	FIRST_TOKEN=1
 fi
 
+AGENT_JSON_CREATED=0
 if [ ! -f "$AGENT_JSON" ]; then
-	python3 - "$EXAMPLE" "$AGENT_JSON" "$CLIENT_CIDRS" "$USBIP_BIN" "$USBIPD_BIN" <<'PY'
-import json, sys
+	AGENT_JSON_CREATED=1
+fi
 
-example, out, cidrs, usbip, usbipd = sys.argv[1:6]
-with open(example, encoding="utf-8") as fh:
+# Generate the desired agent.json: start from the existing file when there is
+# one (so hand edits survive), otherwise from the example. Loopback is added
+# unconditionally in both cases. The on-Pi CLI (yabd status/export/unexport/
+# reset) talks to the agent from 127.0.0.1 and the nftables rule drops 3240/3241
+# from every other address, so a restrictive --client-cidr must never be able to
+# lock the CLI out. The entry is de-duplicated and placed first, and write_file
+# only rewrites when the bytes differ, which is what keeps a re-run idempotent.
+agent_tmp="$(mktemp)"
+python3 - "$EXAMPLE" "$AGENT_JSON" "$CLIENT_CIDRS" "$USBIP_BIN" "$USBIPD_BIN" >"$agent_tmp" <<'PY'
+import json, os, sys
+
+example, existing, cidrs, usbip, usbipd = sys.argv[1:6]
+source = existing if os.path.isfile(existing) else example
+with open(source, encoding="utf-8") as fh:
     cfg = json.load(fh)
 
 if cidrs.strip():
     cfg["allowed_clients"] = [c.strip() for c in cidrs.split(",") if c.strip()]
+
+# Loopback is not optional: drop any stale copy and prepend exactly one.
+allowed = [c for c in (cfg.get("allowed_clients") or []) if c != "127.0.0.0/8"]
+cfg["allowed_clients"] = ["127.0.0.0/8"] + allowed
+
 cfg["token_file"] = "/etc/you-as-bee/token"
 cfg.setdefault("usbip", {})
 cfg["usbip"]["bin"] = usbip
 cfg["usbip"]["usbipd_bin"] = usbipd
 
-with open(out, "w", encoding="utf-8") as fh:
-    json.dump(cfg, fh, indent=2)
-    fh.write("\n")
+print(json.dumps(cfg, indent=2))
 PY
-	chmod 0644 "$AGENT_JSON"
-	CHANGED=1
+write_file "$AGENT_JSON" 0644 <"$agent_tmp"
+rm -f "$agent_tmp"
+if [ "$AGENT_JSON_CREATED" -eq 1 ]; then
 	log "wrote $AGENT_JSON (edit the pinned devices for your dongles)"
 fi
 
-ALLOWED_LIST="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["allowed_clients"]))' "$AGENT_JSON")"
+ALLOWED_LIST="$(python3 -c 'import json,sys; print(",".join((json.load(open(sys.argv[1])).get("allowed_clients") or [])))' "$AGENT_JSON")"
 
 # --- firewall ----------------------------------------------------------------
 
 if [ "$FIREWALL" -eq 1 ]; then
 	CIDR_SET="${ALLOWED_LIST//,/, }"
+	# The loopback accepts are deliberately independent of the allowlist. The
+	# final drop also matches traffic on lo, so without them a restrictive
+	# --client-cidr would drop the on-Pi CLI's own 127.0.0.1:3241 calls and make
+	# the 127.0.0.1:3240 checks in `yabd doctor` fail.
 	desired="$(
 		cat <<EOF
 table inet ${NFT_TABLE} {
 	chain input {
 		type filter hook input priority filter; policy accept;
+		iif "lo" accept
+		ip saddr 127.0.0.0/8 accept
 		ip saddr { ${CIDR_SET} } tcp dport { 3240, 3241 } accept
 		tcp dport { 3240, 3241 } drop
 	}

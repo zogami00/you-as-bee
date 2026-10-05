@@ -4,7 +4,8 @@
 #
 # Stops and disables both units, returns any exported device to its original
 # kernel driver, and removes the files provision.sh installed. /etc/you-as-bee
-# (the token and the config) is kept unless --purge is given.
+# (the token and the config) and /var/lib/you-as-bee are kept unless --purge is
+# given.
 #
 # Usage:
 #   sudo ./uninstall.sh [--purge]
@@ -99,10 +100,10 @@ fi
 systemctl daemon-reload 2>/dev/null || true
 
 if [ "$PURGE" -eq 1 ]; then
-	rm -rf /etc/you-as-bee
-	log "removed /etc/you-as-bee"
+	rm -rf /etc/you-as-bee /var/lib/you-as-bee
+	log "removed /etc/you-as-bee /var/lib/you-as-bee"
 else
-	log "kept /etc/you-as-bee (use --purge to remove it)"
+	log "kept /etc/you-as-bee and /var/lib/you-as-bee (use --purge to remove them)"
 fi
 
 log "uninstalled"

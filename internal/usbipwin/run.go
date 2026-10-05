@@ -106,6 +106,15 @@ func (t *Tool) Attach(ctx context.Context, host, busid string) error {
 // the driver, not in a usbip process, so detaching the port is not enough to
 // stop it. --stop-all is best effort: the port is already detached, so its
 // failure must not turn a successful detach into an error.
+//
+// WARNING: `usbip attach --stop-all` is global, not per-device. It cancels
+// every active attach attempt the driver is running, including attempts for
+// other servers and other devices on this machine. usbip-win2 offers no
+// per-device cancel, and Detach only has the local port number to work with, so
+// there is no narrower call to make. Since this client always attaches with
+// --once (above) it starts none of its own, so in normal operation the call is a
+// no-op; the global side effect only bites when another usbip-win2 user or an
+// older yab left a retry running. This is documented in docs/architecture.md.
 func (t *Tool) Detach(ctx context.Context, port int) error {
 	if port < 0 {
 		return fmt.Errorf("usbipwin: invalid port %d", port)

@@ -20,6 +20,14 @@ surprising and, for a gaming machine, harmful.
   verify a SHA-256 of a release archive when one is supplied
   (`install.ps1 -UsbipArchive ... -UsbipSha256 ...`). Document the pinned
   version in `docs/setup-windows.md`.
+- **Require `usbip-win2 >= 0.9.8.0`.** Every attach passes `--receive-mode`
+  (see `receive_mode` in `docs/configuration.md`), and that flag exists only
+  from 0.9.8.0:
+  v0.9.7.7 has `--once` but not `--receive-mode`. On an older binary attach
+  fails permanently with a generic `usbipwin: usbip exited N`, and there is no
+  supported way to omit the flag without reintroducing the stall flood it
+  prevents. `yab doctor` reports the detected version and **warns** when it is
+  older than 0.9.8.0 or cannot be parsed; it never fails on the version.
 - **Never** change test-signing or Secure Boot automatically. `install.ps1` and
   `yab doctor` only *report* the state they find (`bcdedit /enum {current}` and
   the Secure Boot registry value). Enabling test-signing remains a documented,
