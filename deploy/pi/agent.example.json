@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "listen": "0.0.0.0:3241",
+  "token_file": "/etc/you-as-bee/token",
+  "allowed_clients": [
+    "192.168.0.0/16",
+    "10.0.0.0/8",
+    "172.16.0.0/12"
+  ],
+  "poll_interval": "5s",
+  "usbip": {
+    "bin": "/usr/sbin/usbip",
+    "usbipd_bin": "/usr/sbin/usbipd",
+    "manage_usbipd": true
+  },
+  "devices": [
+    {
+      "name": "bluetooth",
+      "vid": "0a12",
+      "pid": "0001",
+      "mode": "on_demand"
+    },
+    {
+      "name": "xbox-wireless",
+      "vid": "045e",
+      "pid": "02e6",
+      "mode": "always"
+    }
+  ],
+  "log_level": "info",
+  "log_format": "text"
+}

@@ -37,6 +37,15 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files '*.sh' | sort -u)
+          printf 'shellcheck: %s\n' "${files[@]}"
+          shellcheck "${files[@]}"
+
       - name: go test (race)
         if: runner.os == 'Linux'
         run: go test -race ./...
@@ -44,6 +53,22 @@ jobs:
       - name: go test
         if: runner.os != 'Linux'
         run: go test ./...
+
+      - name: PowerShell syntax check
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem -Path deploy/windows -Filter *.ps1 -File) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+            if ($errs -and $errs.Count -gt 0) {
+              Write-Host "::error::$($f.Name): $($errs[0].Message)"
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+          Write-Host 'PowerShell syntax OK'
 
   cross:
     name: cross (${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm }})
