@@ -22,6 +22,7 @@ import (
 	"github.com/zogami00/you-as-bee/internal/sysfs"
 	"github.com/zogami00/you-as-bee/internal/usbiphost"
 	"github.com/zogami00/you-as-bee/internal/version"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 // sysfsSource adapts sysfs enumeration to agent.Source.
@@ -70,7 +71,8 @@ func runAgent(configPath, listen, level, format string, output io.Writer) error 
 		cfg.LogFormat = format
 	}
 
-	logger := newLogger(cfg.LogLevel, cfg.LogFormat, output)
+	logRing := webui.NewLogRing()
+	logger := newLogger(cfg.LogLevel, cfg.LogFormat, output, logRing)
 
 	token, err := readToken(cfg.TokenFile)
 	if err != nil {
@@ -96,6 +98,8 @@ func runAgent(configPath, listen, level, format string, output io.Writer) error 
 		Backend:        rec,
 		UnknownErr:     agent.ErrUnknown,
 		Log:            logger,
+		WebUI:          cfg.WebUI,
+		Logs:           logRing,
 	})
 	if err != nil {
 		return err
@@ -196,7 +200,7 @@ func readToken(path string) (string, error) {
 	return token, nil
 }
 
-func newLogger(level, format string, output io.Writer) *slog.Logger {
+func newLogger(level, format string, output io.Writer, ring *webui.LogRing) *slog.Logger {
 	var lvl slog.Level
 	switch level {
 	case "debug":
@@ -215,7 +219,13 @@ func newLogger(level, format string, output io.Writer) *slog.Logger {
 	} else {
 		handler = slog.NewTextHandler(output, opts)
 	}
-	return slog.New(handler)
+	if ring == nil {
+		return slog.New(handler)
+	}
+	// Fan out to the console handler and the in-memory ring so GET /v1/logs
+	// sees exactly what the process logs. slog.NewMultiHandler exists in the
+	// Go 1.27 standard library.
+	return slog.New(slog.NewMultiHandler(handler, ring))
 }
 
 func portListening(addr string) bool {

@@ -19,6 +19,21 @@ is generated on the Pi from `/dev/urandom`, stored at
 (`crypto/subtle.ConstantTimeCompare`). It is printed once by `provision.sh` for
 the operator to copy to the Windows client.
 
+### Browser session cookies (optional web UI)
+
+With `web_ui: true`, a browser submits the token once to `/ui/login` and
+receives an opaque session id in an `HttpOnly; SameSite=Strict` cookie. The
+token is never written to JavaScript-readable storage; the cookie cannot be
+read by script and is not attached to cross-site requests. Session writes also
+require `X-YAB-CSRF: 1`, which a cross-site form or image cannot set. Sessions
+live in memory only (12 h idle TTL, 32-entry cap), so restarting `yabd` ends
+every session. `web_ui` defaults to `false`, so an upgrade does not create this
+surface unless it is asked for.
+
+Authenticated callers (bearer or session) can now read the agent's recent logs
+via `GET /v1/logs`. Those records can name sysfs paths and bus ids; they add no
+new credential but do widen what a successful authentication reveals.
+
 ### CIDR allowlist
 
 The peer address (`r.RemoteAddr`) must be inside one of `allowed_clients`.
@@ -35,11 +50,13 @@ from `allowed_clients` and drops them from everything else. See
 
 ### There is no TLS
 
-The token is sent in cleartext on every request. So is all API traffic and
-every server-sent event. Anyone who can observe the LAN traffic can read the
-token and then use the API. There is no confidentiality and no integrity: an
-on-path attacker can modify responses. TLS is deliberately out of scope for
-this MVP, but "deliberate" is not "safe".
+The token is sent in cleartext when the client authenticates: on every bearer
+request, and once at browser login. The session cookie that follows is also
+cleartext. So is all API traffic and every server-sent event. Anyone who can
+observe the LAN traffic can read the token or the session cookie and then use
+the API. There is no confidentiality and no integrity: an on-path attacker can
+modify responses. TLS is deliberately out of scope for this MVP, but
+"deliberate" is not "safe".
 
 ### usbipd on 3240 is unauthenticated
 

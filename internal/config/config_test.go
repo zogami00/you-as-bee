@@ -379,3 +379,31 @@ func TestLoadMissingFile(t *testing.T) {
 		t.Fatal("expected error for missing file, got nil")
 	}
 }
+
+// web_ui is opt-in: absent or false keeps the bearer-only surface, and true
+// turns it on. Defaults are applied before decoding, so an explicit value wins.
+func TestAgentWebUIDefaultsOffAndCanBeEnabled(t *testing.T) {
+	var off AgentConfig
+	if err := Load(writeTemp(t, `{}`), &off); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if off.WebUI {
+		t.Error("WebUI default = true, want false")
+	}
+
+	var explicitOff AgentConfig
+	if err := Load(writeTemp(t, `{"schema_version":1,"web_ui":false}`), &explicitOff); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if explicitOff.WebUI {
+		t.Error("WebUI = true for an explicit false")
+	}
+
+	var on AgentConfig
+	if err := Load(writeTemp(t, `{"schema_version":1,"web_ui":true}`), &on); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !on.WebUI {
+		t.Error("WebUI = false for an explicit true")
+	}
+}

@@ -41,6 +41,9 @@ type Device struct {
 	State string `json:"state"`
 	// Mode is the configured export mode ("always" or "on_demand").
 	Mode string `json:"mode"`
+	// LastError carries the most recent bind/unbind failure for the pin, and is
+	// cleared by a successful bind or an explicit reset. Omitted when empty.
+	LastError string `json:"last_error,omitempty"`
 }
 
 // Info describes the agent itself (GET /v1/info).
@@ -68,4 +71,27 @@ type Event struct {
 	Type   string    `json:"type"`
 	Device Device    `json:"device"`
 	At     time.Time `json:"at"`
+}
+
+// LogEntry is one structured log record served by GET /v1/logs.
+type LogEntry struct {
+	// Seq is a monotonically increasing sequence number, starting at 1.
+	Seq uint64 `json:"seq"`
+	// Time is when the record was emitted.
+	Time time.Time `json:"time"`
+	// Level is the lower-case slog level name ("info", "warn", "error").
+	Level string `json:"level"`
+	// Msg is the formatted log message.
+	Msg string `json:"msg"`
+	// Attrs are the structured attributes attached to the record.
+	Attrs map[string]string `json:"attrs,omitempty"`
+}
+
+// LogsResponse is the body of GET /v1/logs.
+type LogsResponse struct {
+	// Entries are the log records after the requested sequence number, oldest
+	// first.
+	Entries []LogEntry `json:"entries"`
+	// Next is the sequence number to pass as the next `after` query value.
+	Next uint64 `json:"next"`
 }

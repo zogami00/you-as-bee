@@ -28,5 +28,6 @@
     }
   ],
   "log_level": "info",
-  "log_format": "text"
+  "log_format": "text",
+  "web_ui": false
 }

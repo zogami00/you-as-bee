@@ -70,6 +70,9 @@ type record struct {
 	failures        []time.Time
 	quarantineUntil time.Time
 	gen             int
+	// lastErr is the most recent bind/unbind failure message, surfaced through
+	// proto.Device.LastError and cleared by a successful action or a reset.
+	lastErr string
 }
 
 // Reconciler owns all device state and performs every sysfs write.
@@ -361,29 +364,34 @@ func (r *Reconciler) commitLocked(p *plannedAction, now time.Time) {
 	if p.release {
 		if p.err != nil {
 			r.warnf("unbind %s failed: %v", p.dev.BusID, p.err)
-			r.failLocked(p.pin, rec, now)
+			r.failLocked(p.pin, rec, now, p.err)
 			return
 		}
 		rec.gen = 0
 		rec.state = Present
 		rec.exportedAt = time.Time{}
+		rec.lastErr = ""
 		return
 	}
 
 	if p.err != nil {
 		r.warnf("bind %s failed: %v", p.dev.BusID, p.err)
-		r.failLocked(p.pin, rec, now)
+		r.failLocked(p.pin, rec, now, p.err)
 		return
 	}
 	rec.gen = p.dev.DevNum
 	rec.exportedAt = now
 	rec.state = Exported
+	rec.lastErr = ""
 }
 
 // failLocked records a bind/reset failure, grows the backoff, and trips the
 // quarantine circuit breaker when failures stack up inside the window. The
 // caller must hold r.mu.
-func (r *Reconciler) failLocked(pin string, rec *record, now time.Time) {
+func (r *Reconciler) failLocked(pin string, rec *record, now time.Time, err error) {
+	if err != nil {
+		rec.lastErr = err.Error()
+	}
 	rec.failures = append(rec.failures, now)
 	cut := now.Add(-failureWindow)
 	kept := rec.failures[:0]
@@ -435,7 +443,7 @@ func (r *Reconciler) rebuildSnapshotLocked(resolved map[string]sysfs.Device, now
 	for _, pin := range r.Pins {
 		rec := r.recordLocked(pin.Name)
 		dev, present := resolved[pin.Name]
-		pd := toProto(pin, rec.state, dev, present)
+		pd := toProto(pin, rec.state, rec.lastErr, dev, present)
 		snapshot = append(snapshot, pd)
 		if present {
 			bybusid[dev.BusID] = pin.Name
@@ -453,6 +461,12 @@ func (r *Reconciler) rebuildSnapshotLocked(resolved map[string]sysfs.Device, now
 			r.publishLocked(proto.Event{Type: typ, Device: pd, At: now})
 		}
 		if seen && prev.State != pd.State {
+			r.publishLocked(proto.Event{Type: proto.EventStateChanged, Device: pd, At: now})
+		}
+		// A changed error message without a state change is still a meaningful
+		// update for the UI, so raise state_changed for it too. The Windows
+		// supervisor ignores state_changed (see client.Manager.HandleEvent).
+		if seen && prev.State == pd.State && prev.LastError != pd.LastError {
 			r.publishLocked(proto.Event{Type: proto.EventStateChanged, Device: pd, At: now})
 		}
 	}
@@ -523,6 +537,7 @@ func (r *Reconciler) Reset(_ context.Context, id string) error {
 	rec.nextAttempt = time.Time{}
 	rec.failures = nil
 	rec.quarantineUntil = time.Time{}
+	rec.lastErr = ""
 	r.signal()
 	return nil
 }
@@ -629,16 +644,17 @@ func (r *Reconciler) resolvePinLocked(id string) (string, bool) {
 	return "", false
 }
 
-func toProto(pin config.DeviceConfig, st State, dev sysfs.Device, present bool) proto.Device {
+func toProto(pin config.DeviceConfig, st State, lastErr string, dev sysfs.Device, present bool) proto.Device {
 	mode := pin.Mode
 	if mode == "" {
 		mode = config.ModeOnDemand
 	}
 	pd := proto.Device{
-		Pin:     pin.Name,
-		Mode:    mode,
-		Present: present,
-		State:   stateToProto(st),
+		Pin:       pin.Name,
+		Mode:      mode,
+		Present:   present,
+		State:     stateToProto(st),
+		LastError: lastErr,
 	}
 	if present {
 		pd.BusID = dev.BusID

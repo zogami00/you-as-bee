@@ -12,6 +12,7 @@ import (
 
 	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/proto"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 type fakeBackend struct {
@@ -64,6 +65,7 @@ func newTestServer(t *testing.T) (*Server, *fakeBackend) {
 		Token:          testToken,
 		AllowedClients: []string{"10.0.0.0/8"},
 		Backend:        backend,
+		WebUI:          true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -233,14 +235,41 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 }
 
+// authedRequest sends a request with a cancelled context so streaming handlers
+// (/v1/events) return instead of blocking the test. It can set either a bearer
+// token, a session cookie, or both.
+func authedRequest(t *testing.T, srv *Server, method, target, remoteAddr, token, session string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(method, target, nil).WithContext(ctx)
+	req.RemoteAddr = remoteAddr
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if session != "" {
+		req.AddCookie(&http.Cookie{Name: webui.SessionCookieName, Value: session})
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
 // TestEveryGuardedRouteRequiresToken enumerates the guarded routes from the
 // server's registration table and asserts each rejects an unauthenticated
-// request, so a new route added without guard fails this test.
+// request, accepts a bearer token, and accepts a session cookie (plus the CSRF
+// header for writes). A new route added without guard, or a route that stops
+// honouring either credential, fails this test.
 func TestEveryGuardedRouteRequiresToken(t *testing.T) {
 	srv, _ := newTestServer(t)
 	if len(srv.guardedRoutes) == 0 {
 		t.Fatal("no guarded routes registered")
 	}
+	session := srv.sessions.Create()
+	csrf := map[string]string{webui.CSRFHeader: webui.CSRFHeaderValue}
 	for _, route := range srv.guardedRoutes {
 		method, pattern, ok := strings.Cut(route, " ")
 		if !ok {
@@ -248,9 +277,26 @@ func TestEveryGuardedRouteRequiresToken(t *testing.T) {
 		}
 		path := strings.ReplaceAll(pattern, "{id}", "bt")
 		t.Run(route, func(t *testing.T) {
-			rec := request(t, srv, method, path, "10.0.0.5:1234", "", nil)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("status = %d, want 401", rec.Code)
+			if rec := request(t, srv, method, path, "10.0.0.5:1234", "", nil); rec.Code != http.StatusUnauthorized {
+				t.Errorf("no auth: status = %d, want 401", rec.Code)
+			}
+			if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", testToken, "", nil); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("bearer: status = %d, want accepted", rec.Code)
+			}
+
+			if method == http.MethodGet || method == http.MethodHead {
+				if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", "", session, nil); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+					t.Errorf("cookie GET: status = %d, want accepted", rec.Code)
+				}
+				return
+			}
+			// A session write without the CSRF header is refused...
+			if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", "", session, nil); rec.Code != http.StatusForbidden {
+				t.Errorf("cookie write without CSRF: status = %d, want 403", rec.Code)
+			}
+			// ...and accepted with it.
+			if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", "", session, csrf); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("cookie write with CSRF: status = %d, want accepted", rec.Code)
 			}
 		})
 	}

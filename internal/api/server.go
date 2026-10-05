@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zogami00/you-as-bee/internal/proto"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 // Backend is the device state the API exposes. It is implemented by the
@@ -43,6 +44,13 @@ type Config struct {
 	UnknownErr error
 	// Log receives request errors. May be nil.
 	Log *slog.Logger
+	// WebUI enables the embedded browser UI and session-cookie auth on /ui/.
+	// It is opt-in (agent config web_ui), so the bearer-token surface is
+	// unchanged when it is false.
+	WebUI bool
+	// Logs, when non-nil, is served by GET /v1/logs. It is the same ring the
+	// process logger fans out to.
+	Logs *webui.LogRing
 }
 
 // Server is the management HTTP server.
@@ -52,6 +60,11 @@ type Server struct {
 	backend    Backend
 	unknownErr error
 	log        *slog.Logger
+	webUI      bool
+	logs       *webui.LogRing
+	sessions   *webui.Sessions
+	codes      *webui.OneTimeCodes
+	login      *loginLimiter
 	mux        *http.ServeMux
 	// guardedRoutes records every route registered with guard, as
 	// "METHOD /pattern". Tests enumerate it so a new guarded route cannot be
@@ -68,6 +81,11 @@ func New(cfg Config) (*Server, error) {
 		backend:    cfg.Backend,
 		unknownErr: cfg.UnknownErr,
 		log:        cfg.Log,
+		webUI:      cfg.WebUI,
+		logs:       cfg.Logs,
+		sessions:   webui.NewSessions(),
+		codes:      webui.NewOneTimeCodes(),
+		login:      newLoginLimiter(),
 		mux:        http.NewServeMux(),
 	}
 	for _, cidr := range cfg.AllowedClients {
@@ -95,11 +113,24 @@ func New(cfg Config) (*Server, error) {
 		{http.MethodPost, "/v1/devices/{id}/unexport", s.handleUnexport},
 		{http.MethodPost, "/v1/devices/{id}/reset", s.handleReset},
 		{http.MethodGet, "/v1/events", s.handleEvents},
+		{http.MethodGet, "/v1/logs", s.handleLogs},
 	}
 	for _, rt := range guarded {
 		pattern := rt.method + " " + rt.pattern
 		s.mux.Handle(pattern, s.guard(rt.handler))
 		s.guardedRoutes = append(s.guardedRoutes, pattern)
+	}
+
+	if cfg.WebUI {
+		// The login page, logout and the assets are deliberately outside the
+		// bearer guard: a browser has no token, it logs in with the token to
+		// obtain a session cookie. The shell is gated on the session inside the
+		// handler so an unauthenticated visitor is redirected to the form.
+		s.mux.HandleFunc("GET /ui/login", s.handleLoginForm)
+		s.mux.HandleFunc("POST /ui/login", s.handleLoginSubmit)
+		s.mux.HandleFunc("POST /ui/logout", s.handleLogout)
+		s.mux.HandleFunc("GET /ui/", s.handleUIIndex)
+		s.mux.Handle("GET /ui/assets/", http.StripPrefix("/ui/assets/", webui.StaticHandler()))
 	}
 
 	addr := cfg.Listen
@@ -127,16 +158,28 @@ func (s *Server) ListenAndServe() error { return s.http.ListenAndServe() }
 // Shutdown stops the server gracefully.
 func (s *Server) Shutdown(ctx context.Context) error { return s.http.Shutdown(ctx) }
 
-// guard enforces the source allowlist and the bearer token. /healthz is the
-// only route registered without guard.
+// guard enforces the source allowlist and authentication. A request passes
+// when its peer is allowlisted and it presents either a valid bearer token or a
+// valid session cookie (the latter with the CSRF header on writes). /healthz is
+// the only route registered without guard.
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.allowlisted(r) {
 			writeError(w, http.StatusForbidden, "forbidden", "client address is not allowed")
 			return
 		}
-		if !s.tokenOK(r) {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		switch {
+		case s.tokenOK(r):
+			// A bearer client is unchanged: no CSRF requirement.
+		case s.sessionOK(r):
+			// A session authenticates a write only with the CSRF header; a
+			// missing header is a forbidden request, not an unauthenticated one.
+			if !isReadMethod(r.Method) && r.Header.Get(webui.CSRFHeader) != webui.CSRFHeaderValue {
+				writeError(w, http.StatusForbidden, "forbidden", "missing CSRF header")
+				return
+			}
+		default:
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid credentials")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -232,6 +275,28 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// handleLogs serves GET /v1/logs, the recent structured log records.
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	limit := webui.DefaultLogsLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "bad_request", "limit must be an integer between 1 and 500")
+			return
+		}
+		if n > webui.MaxLogsLimit {
+			n = webui.MaxLogsLimit
+		}
+		limit = n
+	}
+	if s.logs == nil {
+		writeJSON(w, http.StatusOK, proto.LogsResponse{Entries: []proto.LogEntry{}, Next: after})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.logs.Entries(after, limit))
 }
 
 func (s *Server) backendError(w http.ResponseWriter, err error) {

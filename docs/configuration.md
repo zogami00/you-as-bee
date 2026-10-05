@@ -35,6 +35,7 @@ The agent config lives at `/etc/you-as-bee/agent.json`; the client config at
 | `devices[].mode` | string | `on_demand` | `always` exports as soon as the device is present; `on_demand` waits for a request. |
 | `log_level` | string | `info` | `debug`, `info`, `warn` or `error`. |
 | `log_format` | string | `text` | `text` or `json`. |
+| `web_ui` | bool | `false` | Serve the embedded browser UI at `/ui/` with session-cookie auth. Opt-in: upgrading never enables it. |
 
 `vid`/`pid` alone match any device with that pair. When more than one attached
 device matches a pin and no `serial`/`port` narrows it, the device is
@@ -103,12 +104,17 @@ This is `deploy/pi/agent.example.json` (and what `provision.sh` derives
     }
   ],
   "log_level": "info",
-  "log_format": "text"
+  "log_format": "text",
+  "web_ui": false
 }
 ```
 
 Notes:
 
+- `web_ui` is off by default. Enable it only on a network you trust: the UI
+  runs over the same cleartext HTTP as the API (see
+  [security.md](security.md)). The log endpoint `GET /v1/logs` is available to
+  any authenticated caller whether or not `web_ui` is enabled.
 - The VID/PID pairs are the ones the shipped udev rule and modprobe blacklist
   use (`0a12:0001` is a common CSR Bluetooth dongle; `045e:02e6` is an Xbox
   Wireless Adapter for Windows). Change them to match your dongles.

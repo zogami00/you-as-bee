@@ -13,15 +13,42 @@ Every route under `/v1/` is protected by two checks, in this order:
 1. **CIDR allowlist.** The connection's peer address (`r.RemoteAddr`) must be
    inside one of `allowed_clients`. Forwarding headers such as
    `X-Forwarded-For` are deliberately ignored. Failure: `403 forbidden`.
-2. **Bearer token.** `Authorization: Bearer <64 hex chars>` must equal the
-   token from `token_file`, compared in constant time. Failure:
-   `401 unauthorized`.
+2. **Credential.** Either
+   - `Authorization: Bearer <64 hex chars>` equal to the token from
+     `token_file`, compared in constant time; or
+   - a valid **session cookie** issued by the browser login below.
+
+Failure: `401 unauthorized`.
+
+When the request is authenticated by a session cookie (not a bearer token), a
+state-changing method (anything other than GET/HEAD/OPTIONS) must also carry
+`X-YAB-CSRF: 1`. A missing header is `403 forbidden`, because the caller is
+authenticated but the write is refused. Bearer clients never need the header.
 
 `GET /healthz` is the only route registered without the guard. It returns `ok`
 with no authentication and no allowlist check, so the client can distinguish
 "unreachable" from "reachable but not allowed/authorised".
 
 There is **no TLS**. See [security.md](security.md).
+
+### Browser sessions (`/ui/`)
+
+When `web_ui` is `true` (default `false`, see
+[configuration.md](configuration.md)) the agent serves an embedded UI:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/ui/login` | Token form. Renders a one-time code. |
+| POST | `/ui/login` | Verify code + token; sets the session cookie; `303` to `/ui/`. |
+| POST | `/ui/logout` | Delete the session and clear the cookie; `303` to `/ui/login`. Requires `X-YAB-CSRF: 1`. |
+| GET | `/ui/` | The application shell. Redirects to `/ui/login` without a session. |
+| GET | `/ui/assets/{file}` | Embedded CSS and JavaScript. |
+
+The session cookie is `HttpOnly; SameSite=Strict`, holds an opaque 64-hex-char
+id, and lives only in the agent's memory, so restarting `yabd` logs every
+browser out. The idle TTL is 12 hours. Sessions are capped at 32, oldest
+evicted, and login failures are rate-limited to one per second globally.
+With `web_ui: false` every `/ui/` path is `404`.
 
 ## Routes
 
@@ -35,6 +62,7 @@ There is **no TLS**. See [security.md](security.md).
 | POST | `/v1/devices/{id}/unexport` | Release the device from `usbip-host`. |
 | POST | `/v1/devices/{id}/reset` | Clear backoff, failures and quarantine. |
 | GET | `/v1/events` | Server-sent event stream. |
+| GET | `/v1/logs` | Recent structured log records (`?after=<seq>&limit=<1..500>`). |
 
 `{id}` is either the configured pin name or the bus id the agent currently
 reports for a present device. An id that matches neither is `404 not_found`.
@@ -103,6 +131,7 @@ Device fields:
 | `present` | Physically attached to the Pi right now. |
 | `state` | `unexported`, `exported`, `in_use`, `absent` or `error`. |
 | `mode` | `always` or `on_demand`. |
+| `last_error` | Most recent bind/unbind failure for the pin, omitted when empty. Cleared by a successful bind or an explicit reset. |
 
 `GET /v1/devices/{id}` returns a single device object (no wrapper).
 
@@ -119,6 +148,32 @@ Event `type` is one of `device_added`, `device_removed` or `state_changed`.
 A keepalive comment (`: keepalive`) is sent every 20 seconds so idle
 connections and NAT mappings stay alive. The server clears the write deadline
 for this route, so the stream is not killed by the normal request timeout.
+`state_changed` is also raised when only a device's `last_error` changes.
+
+### GET /v1/logs
+
+Returns the most recent records from the agent's in-memory log ring (1000
+entries, info level and above):
+
+```json
+{
+  "entries": [
+    {
+      "seq": 1,
+      "time": "2026-01-02T15:04:05Z",
+      "level": "info",
+      "msg": "yabd started",
+      "attrs": { "listen": "0.0.0.0:3241", "pins": "2" }
+    }
+  ],
+  "next": 1
+}
+```
+
+`after` is the last sequence number the caller has seen (default `0`);
+`limit` is clamped to `1..500` (default `100`). `next` is the sequence number to
+pass as the following `after` value. `attrs` is omitted when a record has no
+attributes.
 
 ## Error body
 
@@ -130,9 +185,11 @@ Errors use one shape:
 
 | Status | `code` | When |
 |--------|--------|------|
-| 401 | `unauthorized` | Missing or wrong bearer token. |
-| 403 | `forbidden` | Peer address not in `allowed_clients`. |
-| 404 | `not_found` | Unknown device id. |
+| 400 | `bad_request` | Malformed `/v1/logs` `limit`, or an expired login form. |
+| 401 | `unauthorized` | Missing or wrong bearer token / session. |
+| 403 | `forbidden` | Peer address not in `allowed_clients`, or a session write without `X-YAB-CSRF`. |
+| 404 | `not_found` | Unknown device id, or any `/ui/` path with `web_ui: false`. |
+| 429 | `too_many_requests` | Login attempts faster than one per second (rendered form). |
 | 500 | `internal` | Backend failure. The message is generic; the detail is logged, never returned. |
 | 500 | `sse_unsupported` | Response writer cannot stream (should not happen with net/http). |
 
@@ -156,6 +213,13 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
 
 curl -sS -N -H "Authorization: Bearer $TOKEN" \
   -H "Accept: text/event-stream" http://raspberrypi.local:3241/v1/events
+
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "http://raspberrypi.local:3241/v1/logs?after=0&limit=100"
 ```
+
+The browser UI (when `web_ui` is enabled) is at
+`http://raspberrypi.local:3241/ui/`; it redirects to `/ui/login` and then makes
+the same `/v1/` calls above using its session cookie.
 
 
