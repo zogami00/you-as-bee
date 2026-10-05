@@ -25,14 +25,37 @@ With `web_ui: true`, a browser submits the token once to `/ui/login` and
 receives an opaque session id in an `HttpOnly; SameSite=Strict` cookie. The
 token is never written to JavaScript-readable storage; the cookie cannot be
 read by script and is not attached to cross-site requests. Session writes also
-require `X-YAB-CSRF: 1`, which a cross-site form or image cannot set. Sessions
-live in memory only (12 h idle TTL, 32-entry cap), so restarting `yabd` ends
-every session. `web_ui` defaults to `false`, so an upgrade does not create this
-surface unless it is asked for.
+require `X-YAB-CSRF: 1`, which a cross-site form or image cannot set, and are
+checked against the `Origin` header as defence in depth. Sessions live in
+memory only (12 h idle TTL, 32-entry cap, least recently used evicted), so
+restarting `yabd` ends every session. An open `/v1/events` stream is closed as
+soon as its session ends, so a logged-out or expired browser stops receiving
+events. `web_ui` defaults to `false`, so an upgrade does not create this surface
+unless it is asked for.
 
-Authenticated callers (bearer or session) can now read the agent's recent logs
-via `GET /v1/logs`. Those records can name sysfs paths and bus ids; they add no
-new credential but do widen what a successful authentication reveals.
+The `/ui/` routes are behind the same CIDR allowlist as `/v1/`, including the
+login form, logout and the embedded assets. The allowlist is applied before any
+pre-authentication work, because `provision.sh --no-firewall` can leave port
+3241 reachable and the allowlist is then the only application-layer fence. A
+non-allowlisted peer gets `403` even with a valid session cookie. Login attempts
+are rate-limited per peer address, so one client cannot hold the login route at
+`429` and lock the operator out. The Pi login flow does not issue one-time
+codes (the token in the form is the credential); the bounded code type is
+retained for the Windows client's flow.
+
+Every `/ui/` response sets `Content-Security-Policy` (`default-src 'none'`,
+script and style only from `'self'`, no `unsafe-inline`), `X-Content-Type-Options:
+nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. This
+matters because the shell carries the destructive Export/Force/Reset controls.
+
+Authenticated callers (bearer or session) can read the agent's recent logs via
+`GET /v1/logs`. Those records can name sysfs paths and bus ids; they add no new
+credential but do widen what a successful authentication reveals. Filesystem
+paths in those records, and in `proto.Device.last_error` (on `/v1/devices` and
+in SSE events), are redacted before they are returned: a failure that names a
+path is reported as a short, stable reason such as `operation failed`. The full
+error is still written to the agent's own console/journal log, which is not
+exposed over the API.
 
 ### CIDR allowlist
 

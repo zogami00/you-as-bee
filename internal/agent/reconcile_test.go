@@ -856,3 +856,54 @@ func TestLastErrorOnlyChangeRaisesStateChanged(t *testing.T) {
 		t.Fatal("no state_changed event was raised for a LastError change")
 	}
 }
+
+// TestLastErrorRedactsFilesystemPaths: LastError is exposed through the API,
+// SSE and the UI, so a sysfs path in the underlying error must not survive.
+func TestLastErrorRedactsFilesystemPaths(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{
+		src:      src,
+		failBind: true,
+		bindErr:  errors.New("usbiphost: write /sys/bus/usb/drivers/usbip-host/bind: permission denied"),
+	}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := r.Devices(ctx)[0].LastError
+	if got == "" {
+		t.Fatal("LastError empty, want a short safe reason")
+	}
+	if strings.Contains(got, "/") {
+		t.Errorf("LastError leaked a filesystem path: %q", got)
+	}
+}
+
+// TestAbsentDeviceClearsLastError: an unplugged device must not keep reporting
+// a stale failure.
+func TestAbsentDeviceClearsLastError(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src, failBind: true, bindErr: errors.New("boom")}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if r.Devices(ctx)[0].LastError == "" {
+		t.Fatal("LastError not set after a failed bind")
+	}
+
+	src.set() // the device is gone
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if got := r.Devices(ctx)[0].LastError; got != "" {
+		t.Errorf("LastError = %q after the device went absent, want empty", got)
+	}
+	if st := r.Devices(ctx)[0].State; st != proto.StateAbsent {
+		t.Errorf("state = %q, want absent", st)
+	}
+}

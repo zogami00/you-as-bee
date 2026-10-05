@@ -37,7 +37,15 @@ does not enlarge the credential surface".
   browser's `SameSite` policy were relaxed.
 - **Sessions are in memory only.** Restarting the agent logs everyone out; there
   is no session database to steal from disk. The table is capped at 32 entries
-  with oldest eviction, and sessions expire after 12 hours idle.
+  with least-recently-used eviction, and sessions expire after 12 hours idle.
+  An open event stream is closed when its session ends.
+- **The UI routes stay behind the CIDR allowlist.** `/ui/login`, `/ui/logout`
+  and the assets are pre-authentication, but they are not public: the allowlist
+  is checked first on every `/ui/` request, because `provision.sh --no-firewall`
+  can leave the port reachable. Pre-authentication state (sessions, one-time
+  codes, the per-peer limiter) is bounded so an unauthenticated caller cannot
+  grow it without limit, and login rate limiting is per peer so one client
+  cannot lock the operator out.
 - **The bearer path is untouched.** `/v1/` still accepts
   `Authorization: Bearer <token>` with no CSRF header, so `yab`, the CLI and
   every existing script behave exactly as before.

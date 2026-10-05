@@ -114,7 +114,15 @@ Notes:
 - `web_ui` is off by default. Enable it only on a network you trust: the UI
   runs over the same cleartext HTTP as the API (see
   [security.md](security.md)). The log endpoint `GET /v1/logs` is available to
-  any authenticated caller whether or not `web_ui` is enabled.
+  any authenticated caller whether or not `web_ui` is enabled. The `/ui/` routes
+  are behind the same `allowed_clients` allowlist as `/v1/`.
+- **Upgrade ordering.** The loader rejects unknown fields, so a `yabd` older
+  than the one that introduced `web_ui` will reject a config containing the key
+  and crash-loop. The shipped example and therefore every config
+  `provision.sh` creates carries `"web_ui"`, and the script only adds keys. If
+  you roll the binary back past this version, delete the `"web_ui"` line from
+  `/etc/you-as-bee/agent.json` (strict JSON: it cannot be commented out) before
+  starting the older binary. See [setup-pi.md](setup-pi.md).
 - The VID/PID pairs are the ones the shipped udev rule and modprobe blacklist
   use (`0a12:0001` is a common CSR Bluetooth dongle; `045e:02e6` is an Xbox
   Wireless Adapter for Windows). Change them to match your dongles.

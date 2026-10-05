@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -272,6 +273,9 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 	if !present {
 		rec.state = Absent
 		rec.exportedAt = time.Time{}
+		// A device that is no longer attached has no current failure; do not
+		// keep reporting a stale last_error.
+		rec.lastErr = ""
 		return plannedAction{}, false
 	}
 
@@ -390,7 +394,10 @@ func (r *Reconciler) commitLocked(p *plannedAction, now time.Time) {
 // caller must hold r.mu.
 func (r *Reconciler) failLocked(pin string, rec *record, now time.Time, err error) {
 	if err != nil {
-		rec.lastErr = err.Error()
+		// Store only a short, path-free reason: LastError is exposed through
+		// the API, SSE and the UI, and must not leak sysfs internals the way
+		// backendError deliberately avoids. The full error is logged above.
+		rec.lastErr = safeReason(err.Error())
 	}
 	rec.failures = append(rec.failures, now)
 	cut := now.Add(-failureWindow)
@@ -427,6 +434,36 @@ func (r *Reconciler) failLocked(pin string, rec *record, now time.Time, err erro
 	rec.nextAttempt = now.Add(delay)
 	rec.state = Backoff
 	r.warnf("pin %q failed, retrying in %s", pin, delay)
+}
+
+// safeReason reduces an internal bind/unbind error to a short reason that is
+// safe to expose through proto.Device.LastError (and therefore /v1/devices,
+// SSE and the UI). A message that names a filesystem path is replaced with a
+// stable generic reason, because such paths name sysfs internals; the full
+// error is still written to the log. A short, path-free message is preserved so
+// operators keep the useful part.
+func safeReason(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return "operation failed"
+	}
+	// Collapse control characters so a multi-line error cannot smuggle a
+	// second line into the field.
+	msg = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, msg)
+	for _, field := range strings.Fields(msg) {
+		if strings.HasPrefix(field, "/") {
+			return "operation failed"
+		}
+	}
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return msg
 }
 
 // rebuildSnapshotLocked republishes the device snapshot and emits events for

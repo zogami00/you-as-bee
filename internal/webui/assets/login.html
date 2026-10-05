@@ -12,7 +12,7 @@
     <p>Enter the agent token from <code>/etc/you-as-bee/token</code> on the Pi.</p>
     {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
     <form method="post" action="/ui/login">
-      <input type="hidden" name="code" value="{{.Code}}">
+      {{if .Code}}<input type="hidden" name="code" value="{{.Code}}">{{end}}
       <label for="token">Token</label>
       <input id="token" type="password" name="token" autocomplete="off" autofocus required>
       <button type="submit">Sign in</button>

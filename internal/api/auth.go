@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/zogami00/you-as-bee/internal/webui"
@@ -48,17 +49,46 @@ func (s *Server) tokenEqual(got string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
 }
 
-// sessionOK reports whether the request carries a live session cookie. It does
-// not consider the CSRF header; guard applies that separately for writes.
-func (s *Server) sessionOK(r *http.Request) bool {
+// sessionID returns the id of the live session the request carries, if any,
+// refreshing the session's idle clock. The bool is false when the request has
+// no session cookie or the session is not live.
+func (s *Server) sessionID(r *http.Request) (string, bool) {
 	if !s.webUI || s.sessions == nil {
-		return false
+		return "", false
 	}
 	cookie, err := r.Cookie(webui.SessionCookieName)
 	if err != nil {
+		return "", false
+	}
+	if !s.sessions.Validate(cookie.Value) {
+		return "", false
+	}
+	return cookie.Value, true
+}
+
+// peerKey names the connection peer for the per-peer login limiter. The
+// allowlist has already passed when this is called, so the address is the
+// one the operator's client actually used.
+func peerKey(r *http.Request) string {
+	if ip := remoteIP(r); ip != nil {
+		return ip.String()
+	}
+	return r.RemoteAddr
+}
+
+// sameOrigin is defence in depth for session-authenticated writes. When a
+// browser sends an Origin header it must match the request host; a missing
+// Origin (non-browser client) is allowed. It complements the CSRF header.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
 		return false
 	}
-	return s.sessions.Validate(cookie.Value)
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // isReadMethod reports whether a method is safe/read-only. Session-authenticated

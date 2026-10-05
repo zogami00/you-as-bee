@@ -8,11 +8,14 @@ Base URL example: `http://raspberrypi.local:3241`.
 
 ## Authentication
 
-Every route under `/v1/` is protected by two checks, in this order:
+Every route except `/healthz` is protected by two checks, in this order:
 
 1. **CIDR allowlist.** The connection's peer address (`r.RemoteAddr`) must be
    inside one of `allowed_clients`. Forwarding headers such as
    `X-Forwarded-For` are deliberately ignored. Failure: `403 forbidden`.
+   This applies to the browser UI routes (`/ui/...`) too, including the login
+   form, logout and the assets: the allowlist is checked before any
+   pre-authentication work happens.
 2. **Credential.** Either
    - `Authorization: Bearer <64 hex chars>` equal to the token from
      `token_file`, compared in constant time; or
@@ -38,17 +41,25 @@ When `web_ui` is `true` (default `false`, see
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/ui/login` | Token form. Renders a one-time code. |
-| POST | `/ui/login` | Verify code + token; sets the session cookie; `303` to `/ui/`. |
+| GET | `/ui/login` | Token form. The Pi flow issues no one-time code; the token is the credential. |
+| POST | `/ui/login` | Verify the token; sets the session cookie; `303` to `/ui/`. The body is capped at 4 KiB. |
 | POST | `/ui/logout` | Delete the session and clear the cookie; `303` to `/ui/login`. Requires `X-YAB-CSRF: 1`. |
-| GET | `/ui/` | The application shell. Redirects to `/ui/login` without a session. |
+| GET | `/ui/` | The application shell. Redirects to `/ui/login` without a session. Any deeper `/ui/<path>` also serves the shell (a deliberate SPA fallthrough); the more specific `/ui/assets/` pattern still serves real files. |
 | GET | `/ui/assets/{file}` | Embedded CSS and JavaScript. |
+
+Every `/ui/` response carries `Content-Security-Policy` (no `unsafe-inline`),
+`X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`, because the shell
+exposes the destructive Export/Force/Reset controls.
 
 The session cookie is `HttpOnly; SameSite=Strict`, holds an opaque 64-hex-char
 id, and lives only in the agent's memory, so restarting `yabd` logs every
-browser out. The idle TTL is 12 hours. Sessions are capped at 32, oldest
-evicted, and login failures are rate-limited to one per second globally.
-With `web_ui: false` every `/ui/` path is `404`.
+browser out. The idle TTL is 12 hours; the cookie's `Max-Age` is refreshed on
+every session-authenticated request so it tracks that idle window rather than
+expiring a fixed 12 hours after login. Sessions are capped at 32, least recently
+used evicted, and login attempts are rate-limited to one per second **per peer
+address**, so one client cannot lock the operator out. An open `/v1/events`
+stream is closed as soon as its session ends. With `web_ui: false` every `/ui/`
+path is `404` for an allowlisted peer and `403` for a non-allowlisted one.
 
 ## Routes
 
@@ -131,7 +142,7 @@ Device fields:
 | `present` | Physically attached to the Pi right now. |
 | `state` | `unexported`, `exported`, `in_use`, `absent` or `error`. |
 | `mode` | `always` or `on_demand`. |
-| `last_error` | Most recent bind/unbind failure for the pin, omitted when empty. Cleared by a successful bind or an explicit reset. |
+| `last_error` | Short, path-free reason for the most recent bind/unbind failure, omitted when empty. Cleared by a successful bind, an explicit reset, or the device going absent. Filesystem detail is redacted; see [security.md](security.md). |
 
 `GET /v1/devices/{id}` returns a single device object (no wrapper).
 
@@ -173,23 +184,25 @@ entries, info level and above):
 `after` is the last sequence number the caller has seen (default `0`);
 `limit` is clamped to `1..500` (default `100`). `next` is the sequence number to
 pass as the following `after` value. `attrs` is omitted when a record has no
-attributes.
+attributes. Filesystem paths in a record's message and attributes are redacted
+before they are returned, matching the `last_error` redaction; the full record
+is still written to the agent's own log/journal.
 
 ## Error body
 
 Errors use one shape:
 
 ```json
-{ "code": "unauthorized", "message": "missing or invalid bearer token" }
+{ "code": "unauthorized", "message": "missing or invalid credentials" }
 ```
 
 | Status | `code` | When |
 |--------|--------|------|
-| 400 | `bad_request` | Malformed `/v1/logs` `limit`, or an expired login form. |
+| 400 | `bad_request` | Malformed `/v1/logs` `limit`, or a login form that is malformed or over the 4 KiB body cap. |
 | 401 | `unauthorized` | Missing or wrong bearer token / session. |
-| 403 | `forbidden` | Peer address not in `allowed_clients`, or a session write without `X-YAB-CSRF`. |
-| 404 | `not_found` | Unknown device id, or any `/ui/` path with `web_ui: false`. |
-| 429 | `too_many_requests` | Login attempts faster than one per second (rendered form). |
+| 403 | `forbidden` | Peer address not in `allowed_clients` (on any route, including `/ui/...`), a session write without `X-YAB-CSRF`, or a session write whose `Origin` host does not match. |
+| 404 | `not_found` | Unknown device id, or any `/ui/` path with `web_ui: false` (when the peer is allowlisted). |
+| 429 | `too_many_requests` | Login attempts from the same peer faster than one per second (rendered form). |
 | 500 | `internal` | Backend failure. The message is generic; the detail is logged, never returned. |
 | 500 | `sse_unsupported` | Response writer cannot stream (should not happen with net/http). |
 

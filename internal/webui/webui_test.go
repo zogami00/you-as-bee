@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -78,6 +79,138 @@ func TestSessionsCapEvictsOldest(t *testing.T) {
 	}
 }
 
+// TestSessionsEvictByLastSeenNotCreation: the least recently used session is
+// evicted, so a session the browser is actively using survives even though it
+// was created first.
+func TestSessionsEvictByLastSeenNotCreation(t *testing.T) {
+	s := NewSessions()
+	base := time.Unix(1000, 0)
+	tick := 0
+	s.now = func() time.Time { return base.Add(time.Duration(tick) * time.Second) }
+
+	ids := make([]string, 0, maxSessions)
+	for i := 0; i < maxSessions; i++ {
+		tick++
+		ids = append(ids, s.Create())
+	}
+	// Touch the oldest-created session so it becomes the most recently used.
+	tick++
+	if !s.Validate(ids[0]) {
+		t.Fatal("fresh session failed to validate")
+	}
+	// Adding one more evicts the least recently used, which is now ids[1].
+	tick++
+	s.Create()
+
+	if !s.Validate(ids[0]) {
+		t.Error("the most recently used session was evicted")
+	}
+	if s.Validate(ids[1]) {
+		t.Error("the least recently used session survived eviction")
+	}
+}
+
+// TestSessionsWatchClosesOnDelete: an open stream watching a session is told
+// immediately when that session is deleted.
+func TestSessionsWatchClosesOnDelete(t *testing.T) {
+	s := NewSessions()
+	id := s.Create()
+	done, ok := s.Watch(id)
+	if !ok {
+		t.Fatal("Watch(live session) = false, want true")
+	}
+	select {
+	case <-done:
+		t.Fatal("watch channel closed before the session ended")
+	default:
+	}
+	s.Delete(id)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watch channel was not closed by Delete")
+	}
+	if _, ok := s.Watch(id); ok {
+		t.Error("Watch(deleted session) = true, want false")
+	}
+}
+
+// TestSessionsWatchClosesOnEviction: eviction must also end a watcher, not just
+// an explicit logout.
+func TestSessionsWatchClosesOnEviction(t *testing.T) {
+	s := NewSessions()
+	base := time.Unix(1000, 0)
+	tick := 0
+	s.now = func() time.Time { return base.Add(time.Duration(tick) * time.Second) }
+
+	first := s.Create()
+	done, ok := s.Watch(first)
+	if !ok {
+		t.Fatal("Watch(live session) = false")
+	}
+	for i := 0; i < maxSessions; i++ {
+		tick++
+		s.Create()
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("evicting a session did not close its watch channel")
+	}
+}
+
+// TestSessionsAliveDoesNotRefresh: Alive distinguishes "still live" from
+// "expired" without sliding the idle clock, so an open stream cannot keep an
+// abandoned session alive.
+func TestSessionsAliveDoesNotRefresh(t *testing.T) {
+	s := NewSessions()
+	s.ttl = time.Minute
+	now := time.Unix(1000, 0)
+	s.now = func() time.Time { return now }
+
+	id := s.Create()
+	now = now.Add(59 * time.Second)
+	if !s.Alive(id) {
+		t.Fatal("Alive(59s) = false, want true")
+	}
+	now = now.Add(2 * time.Second) // total 61s idle: Alive must not have refreshed
+	if s.Alive(id) {
+		t.Fatal("Alive did not treat the session as expired; it refreshed the clock")
+	}
+}
+
+// TestOneTimeCodesBoundedAndCheap: the pre-authentication code table is capped,
+// evicts the oldest, and issuing a flood stays fast (no O(n) scan per call).
+func TestOneTimeCodesBoundedAndCheap(t *testing.T) {
+	c := NewOneTimeCodes()
+	if maxOneTimeCodes < 2 || c.max != maxOneTimeCodes {
+		t.Fatalf("cap = %d, want %d", c.max, maxOneTimeCodes)
+	}
+
+	first := c.Issue()
+	for i := 0; i < maxOneTimeCodes*4; i++ {
+		c.Issue()
+	}
+	if c.Len() > maxOneTimeCodes {
+		t.Fatalf("Len = %d, want <= %d", c.Len(), maxOneTimeCodes)
+	}
+	// The oldest code has been evicted and can no longer be redeemed.
+	if c.Redeem(first) {
+		t.Error("the evicted oldest code was still redeemable")
+	}
+
+	start := time.Now()
+	for i := 0; i < 20000; i++ {
+		c.Issue()
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("issuing 20000 codes took %s; the table is not O(1)", elapsed)
+	}
+	if c.Len() > maxOneTimeCodes {
+		t.Errorf("Len = %d after the flood, want <= %d", c.Len(), maxOneTimeCodes)
+	}
+}
+
 func TestOneTimeCodesSingleUseAndExpiry(t *testing.T) {
 	c := NewOneTimeCodes()
 	now := time.Unix(1000, 0)
@@ -101,6 +234,68 @@ func TestOneTimeCodesSingleUseAndExpiry(t *testing.T) {
 	now = now.Add(OneTimeCodeTTL)
 	if c.Redeem(expiring) {
 		t.Fatal("Redeem(expired code) = true, want false")
+	}
+}
+
+// TestSessionsConcurrentUse exercises create/validate/delete/watch from many
+// goroutines. It is meaningful under -race (CI); locally the race detector is
+// unavailable with CGO_ENABLED=0, so it at least asserts the invariants do not
+// break and nothing panics under concurrent access.
+func TestSessionsConcurrentUse(t *testing.T) {
+	s := NewSessions()
+	var wg sync.WaitGroup
+	// Stay below maxSessions so no goroutine's live session is evicted by a
+	// concurrent Create; eviction itself is covered by the dedicated test.
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				id := s.Create()
+				if !s.Validate(id) {
+					t.Errorf("fresh session failed to validate")
+					return
+				}
+				done, ok := s.Watch(id)
+				if !ok {
+					t.Errorf("Watch(live session) = false")
+					return
+				}
+				select {
+				case <-done:
+					t.Errorf("watch channel closed while the session was live")
+				default:
+				}
+				s.Delete(id)
+				s.Len()
+			}
+		}()
+	}
+	wg.Wait()
+	if s.Len() > maxSessions {
+		t.Fatalf("Len = %d after concurrent use, want <= %d", s.Len(), maxSessions)
+	}
+}
+
+// TestOneTimeCodesConcurrentIssueRedeem drives issue/redeem from many
+// goroutines and asserts the table stays capped.
+func TestOneTimeCodesConcurrentIssueRedeem(t *testing.T) {
+	c := NewOneTimeCodes()
+	var wg sync.WaitGroup
+	for g := 0; g < 16; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				code := c.Issue()
+				c.Redeem(code)
+				c.Len()
+			}
+		}()
+	}
+	wg.Wait()
+	if c.Len() > maxOneTimeCodes {
+		t.Fatalf("Len = %d after concurrent use, want <= %d", c.Len(), maxOneTimeCodes)
 	}
 }
 
@@ -185,6 +380,31 @@ func TestEmbeddedAssetsContainNoBrowserStorageOrTokenAPIs(t *testing.T) {
 		for _, needle := range forbidden {
 			if bytes.Contains(data, []byte(needle)) {
 				t.Errorf("%s contains forbidden string %q", path, needle)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk embedded assets: %v", err)
+	}
+}
+
+// TestEmbeddedAssetsHaveNoInlineScriptOrStyle keeps the strict UI
+// Content-Security-Policy (no 'unsafe-inline') valid: the shell must load its
+// script and style from external files only.
+func TestEmbeddedAssetsHaveNoInlineScriptOrStyle(t *testing.T) {
+	forbidden := []string{"<script>", "onclick=", "onload=", "onerror=", "javascript:", ` style="`}
+	err := fs.WalkDir(assetsFS, "assets", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := fs.ReadFile(assetsFS, path)
+		if err != nil {
+			return err
+		}
+		for _, needle := range forbidden {
+			if bytes.Contains(data, []byte(needle)) {
+				t.Errorf("%s contains forbidden inline construct %q", path, needle)
 			}
 		}
 		return nil

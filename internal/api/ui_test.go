@@ -1,13 +1,15 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,34 +36,7 @@ func newWebUIServer(t *testing.T, webUI bool) *Server {
 
 func doUI(t *testing.T, srv *Server, method, target string, vals url.Values, cookie string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	var body *strings.Reader
-	req := httptest.NewRequest(method, target, nil)
-	if vals != nil {
-		body = strings.NewReader(vals.Encode())
-		req = httptest.NewRequest(method, target, body)
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
-	req.RemoteAddr = "10.0.0.5:1234"
-	if cookie != "" {
-		req.AddCookie(&http.Cookie{Name: webui.SessionCookieName, Value: cookie})
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	return rec
-}
-
-var codeRe = regexp.MustCompile(`name="code" value="([0-9a-f]+)"`)
-
-func extractCode(t *testing.T, rec *httptest.ResponseRecorder) string {
-	t.Helper()
-	m := codeRe.FindStringSubmatch(rec.Body.String())
-	if m == nil {
-		t.Fatalf("no one-time code in login form:\n%s", rec.Body.String())
-	}
-	return m[1]
+	return doUIFrom(t, srv, method, target, vals, "10.0.0.5:1234", cookie, headers)
 }
 
 func sessionCookie(t *testing.T, rec *httptest.ResponseRecorder) string {
@@ -107,10 +82,9 @@ func TestLoginIssuesSessionAndIndexRenders(t *testing.T) {
 	if form.Code != http.StatusOK {
 		t.Fatalf("GET /ui/login = %d, want 200", form.Code)
 	}
-	code := extractCode(t, form)
 
 	login := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {testToken}}, "", nil)
+		url.Values{"token": {testToken}}, "", nil)
 	if login.Code != http.StatusSeeOther {
 		t.Fatalf("POST /ui/login = %d, want 303 (body %s)", login.Code, login.Body.String())
 	}
@@ -128,6 +102,20 @@ func TestLoginIssuesSessionAndIndexRenders(t *testing.T) {
 	}
 }
 
+// TestLoginFormHasNoOneTimeCode: the Pi login flow no longer issues a one-time
+// code (it was the pre-auth flooding vector). The shared form only carries the
+// code field when the renderer supplies one, which the Windows flow will.
+func TestLoginFormHasNoOneTimeCode(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	form := doUI(t, srv, http.MethodGet, "/ui/login", nil, "", nil)
+	if form.Code != http.StatusOK {
+		t.Fatalf("GET /ui/login = %d, want 200", form.Code)
+	}
+	if strings.Contains(form.Body.String(), `name="code"`) {
+		t.Errorf("Pi login form still carries a one-time code field:\n%s", form.Body.String())
+	}
+}
+
 func TestUIIndexRedirectsWithoutSession(t *testing.T) {
 	srv := newWebUIServer(t, true)
 	rec := doUI(t, srv, http.MethodGet, "/ui/", nil, "", nil)
@@ -141,32 +129,21 @@ func TestUIIndexRedirectsWithoutSession(t *testing.T) {
 
 func TestLoginRejectsWrongToken(t *testing.T) {
 	srv := newWebUIServer(t, true)
-	form := doUI(t, srv, http.MethodGet, "/ui/login", nil, "", nil)
-	code := extractCode(t, form)
-
 	rec := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {"wrong-token"}}, "", nil)
+		url.Values{"token": {"wrong-token"}}, "", nil)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rec.Code)
 	}
 }
 
-func TestLoginCodeIsSingleUse(t *testing.T) {
+// TestLoginIgnoresUnknownCodeField: a stray code field (as an older cached page
+// might submit) does not authenticate and does not break a valid token.
+func TestLoginIgnoresUnknownCodeField(t *testing.T) {
 	srv := newWebUIServer(t, true)
-	form := doUI(t, srv, http.MethodGet, "/ui/login", nil, "", nil)
-	code := extractCode(t, form)
-
-	first := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {testToken}}, "", nil)
-	if first.Code != http.StatusSeeOther {
-		t.Fatalf("first login = %d, want 303", first.Code)
-	}
-
-	// The same code is dead, so a replay fails even with the right token.
-	replay := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {testToken}}, "", nil)
-	if replay.Code == http.StatusSeeOther {
-		t.Fatal("a spent one-time code was accepted")
+	rec := doUI(t, srv, http.MethodPost, "/ui/login",
+		url.Values{"code": {"deadbeef"}, "token": {testToken}}, "", nil)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("valid token with an unrelated code field = %d, want 303", rec.Code)
 	}
 }
 
@@ -175,28 +152,71 @@ func TestLoginRateLimit(t *testing.T) {
 	now := time.Unix(1000, 0)
 	srv.login.now = func() time.Time { return now }
 
-	form := doUI(t, srv, http.MethodGet, "/ui/login", nil, "", nil)
-	code := extractCode(t, form)
-
 	first := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {"wrong-token"}}, "", nil)
+		url.Values{"token": {"wrong-token"}}, "", nil)
 	if first.Code != http.StatusUnauthorized {
 		t.Fatalf("first failed attempt = %d, want 401", first.Code)
 	}
 
 	immediate := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {testToken}}, "", nil)
+		url.Values{"token": {testToken}}, "", nil)
 	if immediate.Code != http.StatusTooManyRequests {
 		t.Fatalf("immediate second attempt = %d, want 429", immediate.Code)
 	}
 
 	now = now.Add(time.Second)
-	form = doUI(t, srv, http.MethodGet, "/ui/login", nil, "", nil)
-	code = extractCode(t, form)
 	after := doUI(t, srv, http.MethodPost, "/ui/login",
-		url.Values{"code": {code}, "token": {testToken}}, "", nil)
+		url.Values{"token": {testToken}}, "", nil)
 	if after.Code != http.StatusSeeOther {
 		t.Fatalf("attempt after the limiter window = %d, want 303", after.Code)
+	}
+}
+
+// TestLoginLimiterIsPerPeer: one peer failing cannot throttle another peer. A
+// global limiter would have let any client lock the operator out.
+func TestLoginLimiterIsPerPeer(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	now := time.Unix(1000, 0)
+	srv.login.now = func() time.Time { return now }
+
+	if !srv.login.allow("10.0.0.5") {
+		t.Fatal("first attempt from peer A was refused")
+	}
+	// Peer A is now throttled...
+	if srv.login.allow("10.0.0.5") {
+		t.Fatal("peer A was allowed twice inside the window")
+	}
+	// ...but peer B is untouched.
+	if !srv.login.allow("10.0.0.6") {
+		t.Fatal("peer B was throttled by peer A's failure")
+	}
+}
+
+// TestLoginLimiterAtomicBurst: allow() records the attempt in the same critical
+// section as the check, so a concurrent burst cannot all pass before the first
+// failure registers.
+func TestLoginLimiterAtomicBurst(t *testing.T) {
+	l := newLoginLimiter()
+	l.now = func() time.Time { return time.Unix(1000, 0) }
+
+	const n = 64
+	var wg sync.WaitGroup
+	var allowed int32
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if l.allow("10.0.0.5") {
+				atomic.AddInt32(&allowed, 1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if allowed != 1 {
+		t.Fatalf("allowed = %d concurrent attempts, want exactly 1", allowed)
 	}
 }
 
@@ -274,4 +294,258 @@ func TestLogsEndpointPages(t *testing.T) {
 	if len(page2.Entries) != 1 || page2.Entries[0].Seq != 3 || page2.Next != 3 {
 		t.Fatalf("page2 = %+v", page2)
 	}
+}
+
+// TestUIRoutesRejectNonAllowlisted is the BLOCKER 1 regression: every /ui/ path,
+// including login, logout and the assets, must run the CIDR allowlist first.
+// Before the fix these were registered directly on the mux, so a disallowed
+// peer got 200 and a live login surface (and issued codes).
+func TestUIRoutesRejectNonAllowlisted(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	const outside = "203.0.113.9:1234"
+	cases := []struct {
+		method string
+		target string
+		vals   url.Values
+	}{
+		{http.MethodGet, "/ui/login", nil},
+		{http.MethodPost, "/ui/login", url.Values{"token": {testToken}}},
+		{http.MethodPost, "/ui/logout", nil},
+		{http.MethodGet, "/ui/", nil},
+		{http.MethodGet, "/ui/assets/app.css", nil},
+		{http.MethodGet, "/ui/assets/app.js", nil},
+		{http.MethodGet, "/ui/anything", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+" "+tc.target, func(t *testing.T) {
+			rec := doUIFrom(t, srv, tc.method, tc.target, tc.vals, outside, "", nil)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s %s from a non-allowlisted peer = %d, want 403", tc.method, tc.target, rec.Code)
+			}
+		})
+	}
+}
+
+// TestUIRouteRejectsNonAllowlistedEvenWithSession: a valid session cookie does
+// not excuse a non-allowlisted peer; the allowlist is checked first.
+func TestUIRouteRejectsNonAllowlistedEvenWithSession(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	session := srv.sessions.Create()
+
+	rec := doUIFrom(t, srv, http.MethodGet, "/ui/", nil, "203.0.113.9:1234", session, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("GET /ui/ with a session from a disallowed peer = %d, want 403", rec.Code)
+	}
+	// The same cookie from an allowlisted peer is accepted.
+	rec = doUI(t, srv, http.MethodGet, "/ui/", nil, session, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /ui/ with a session from an allowlisted peer = %d, want 200", rec.Code)
+	}
+}
+
+// TestUISecurityHeaders checks the browser hardening applied to UI responses.
+func TestUISecurityHeaders(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	for _, target := range []string{"/ui/login", "/ui/assets/app.js"} {
+		rec := doUI(t, srv, http.MethodGet, target, nil, "", nil)
+		h := rec.Result().Header
+		if got := h.Get("Content-Security-Policy"); got == "" || strings.Contains(got, "unsafe-inline") {
+			t.Errorf("%s Content-Security-Policy = %q", target, got)
+		}
+		if h.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("%s X-Content-Type-Options = %q, want nosniff", target, h.Get("X-Content-Type-Options"))
+		}
+		if h.Get("X-Frame-Options") != "DENY" {
+			t.Errorf("%s X-Frame-Options = %q, want DENY", target, h.Get("X-Frame-Options"))
+		}
+	}
+}
+
+// TestLoginBodyIsCapped: an unauthenticated POST cannot make the server buffer
+// a large body.
+func TestLoginBodyIsCapped(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	rec := doUI(t, srv, http.MethodPost, "/ui/login",
+		url.Values{"token": {strings.Repeat("a", maxLoginBody*2)}}, "", nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized login body = %d, want 400", rec.Code)
+	}
+}
+
+// TestSessionCookieSlidesWithIdleTTL: a session-authenticated request refreshes
+// the cookie Max-Age to the idle TTL rather than leaving a fixed window from
+// login.
+func TestSessionCookieSlidesWithIdleTTL(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	session := srv.sessions.Create()
+
+	rec := authedRequest(t, srv, http.MethodGet, "/v1/devices", "10.0.0.5:1234", "", session, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("session GET = %d, want 200", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == webui.SessionCookieName {
+			if want := int(webui.SessionTTL.Seconds()); c.MaxAge != want {
+				t.Fatalf("refreshed cookie Max-Age = %d, want %d", c.MaxAge, want)
+			}
+			return
+		}
+	}
+	t.Fatal("no session cookie was refreshed on the request")
+}
+
+// TestSessionWriteRejectsForeignOrigin: the Origin header is defence in depth
+// for destructive session writes.
+func TestSessionWriteRejectsForeignOrigin(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	session := srv.sessions.Create()
+	headers := map[string]string{
+		webui.CSRFHeader: webui.CSRFHeaderValue,
+		"Origin":         "http://evil.example",
+	}
+	rec := authedRequest(t, srv, http.MethodPost, "/v1/devices/bt/reset", "10.0.0.5:1234", "", session, headers)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("foreign Origin write = %d, want 403", rec.Code)
+	}
+	// A same-origin write is accepted.
+	headers["Origin"] = "http://example.com"
+	rec = authedRequest(t, srv, http.MethodPost, "/v1/devices/bt/reset", "10.0.0.5:1234", "", session, headers)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("same-origin write = %d, want 200", rec.Code)
+	}
+}
+
+// TestAssetsServedAndUnknownUIFallsThrough documents finding 10: /ui/<anything>
+// serves the shell (an intentional SPA fallthrough) while the more specific
+// /ui/assets/ pattern still serves real files, not HTML.
+func TestAssetsServedAndUnknownUIFallsThrough(t *testing.T) {
+	srv := newWebUIServer(t, true)
+	session := srv.sessions.Create()
+
+	asset := doUI(t, srv, http.MethodGet, "/ui/assets/app.js", nil, "", nil)
+	if asset.Code != http.StatusOK {
+		t.Fatalf("GET /ui/assets/app.js = %d, want 200", asset.Code)
+	}
+	if !strings.Contains(asset.Body.String(), "use strict") {
+		t.Fatalf("app.js was shadowed by the shell:\n%s", asset.Body.String())
+	}
+
+	shell := doUI(t, srv, http.MethodGet, "/ui/does-not-exist", nil, session, nil)
+	if shell.Code != http.StatusOK || !strings.Contains(shell.Body.String(), "<!doctype html>") {
+		t.Fatalf("GET /ui/does-not-exist = %d, want the shell (200)", shell.Code)
+	}
+}
+
+// TestLogsEndpointRedactsPaths: the /v1/logs mirror must not leak sysfs paths
+// even though the console copy keeps them.
+func TestLogsEndpointRedactsPaths(t *testing.T) {
+	ring := webui.NewLogRing()
+	slog.New(ring).Warn("bind 1-1.2 failed: usbiphost: write /sys/bus/usb/drivers/usbip-host/bind: permission denied",
+		"path", "/sys/bus/usb/devices/1-1.2")
+
+	srv, err := New(Config{
+		Token:          testToken,
+		AllowedClients: []string{"10.0.0.0/8"},
+		Backend:        &fakeBackend{},
+		Logs:           ring,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := request(t, srv, http.MethodGet, "/v1/logs", "10.0.0.5:1234", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/logs = %d, want 200", rec.Code)
+	}
+	var resp proto.LogsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(resp.Entries))
+	}
+	if strings.Contains(resp.Entries[0].Msg, "/sys/") {
+		t.Errorf("log message leaked a sysfs path: %q", resp.Entries[0].Msg)
+	}
+	if strings.Contains(resp.Entries[0].Attrs["path"], "/sys/") {
+		t.Errorf("log attrs leaked a sysfs path: %q", resp.Entries[0].Attrs["path"])
+	}
+}
+
+// streamBackend signals when a stream handler has subscribed, so a test can
+// delete the session knowing the handler is already watching it.
+type streamBackend struct {
+	fakeBackend
+	subscribed chan struct{}
+}
+
+func (b *streamBackend) Subscribe(context.Context) (<-chan proto.Event, func()) {
+	close(b.subscribed)
+	return make(chan proto.Event), func() {}
+}
+
+// TestEventStreamClosesWhenSessionDeleted: a logged-out session must stop
+// receiving /v1/events immediately, not at client disconnect.
+func TestEventStreamClosesWhenSessionDeleted(t *testing.T) {
+	backend := &streamBackend{
+		fakeBackend: fakeBackend{devices: []proto.Device{{Pin: "bt", BusID: "1-1.2", Present: true}}},
+		subscribed:  make(chan struct{}),
+	}
+	srv, err := New(Config{
+		Token:          testToken,
+		AllowedClients: []string{"10.0.0.0/8"},
+		Backend:        backend,
+		WebUI:          true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	session := srv.sessions.Create()
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.RemoteAddr = "10.0.0.5:1234"
+	req.AddCookie(&http.Cookie{Name: webui.SessionCookieName, Value: session})
+	rec := httptest.NewRecorder()
+
+	finished := make(chan struct{})
+	go func() {
+		srv.Handler().ServeHTTP(rec, req)
+		close(finished)
+	}()
+
+	select {
+	case <-backend.subscribed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event stream did not subscribe")
+	}
+	srv.sessions.Delete(session)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event stream stayed open after the session was deleted")
+	}
+}
+
+// doUIFrom is doUI with an explicit peer address.
+func doUIFrom(t *testing.T, srv *Server, method, target string, vals url.Values, remoteAddr, cookie string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var req *http.Request
+	if vals != nil {
+		req = httptest.NewRequest(method, target, strings.NewReader(vals.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	} else {
+		req = httptest.NewRequest(method, target, nil)
+	}
+	if remoteAddr == "" {
+		remoteAddr = "10.0.0.5:1234"
+	}
+	req.RemoteAddr = remoteAddr
+	if cookie != "" {
+		req.AddCookie(&http.Cookie{Name: webui.SessionCookieName, Value: cookie})
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
 }
