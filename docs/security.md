@@ -43,6 +43,33 @@ are rate-limited per peer address, so one client cannot hold the login route at
 codes (the token in the form is the credential); the bounded code type is
 retained for the Windows client's flow.
 
+### Windows local UI and the local-attacker model
+
+The Windows client (`yab tray`) can serve a loopback-only UI on
+`127.0.0.1:<ephemeral>`. It never holds the Pi token: the tray issues a
+256-bit, single-use, 60-second code and opens `/ui/login?code=...`, the first
+GET binds the code to an `HttpOnly` browser cookie, and only that browser can
+redeem it for a session cookie. This narrows the window for a code copied out
+of the URL, but it is **not** a strong local boundary, and it is not meant to
+be one:
+
+- Without the code, another local process gets nothing: it cannot redeem, and
+  every state/action route requires the session cookie.
+- **With** the code, a local process can obtain a session. `Bind` is
+  first-come, so if it loads `/ui/login?code=...` before the user's browser it
+  owns the binding. The code is briefly visible on the `explorer.exe` command
+  line, and on Windows a same-user, medium-integrity process may be able to
+  read another process's command line, so a same-user attacker can plausibly
+  race for it.
+- Such a session can attach/detach (pause) **already-configured** pins and read
+  the recent logs. It **cannot** add or remove servers, and it never sees the
+  Pi API token.
+
+`yab_session` is **host-scoped, not port-scoped**. Cookies are keyed by host
+without the port, so any other local server the browser visits on
+`127.0.0.1:<any port>` receives this cookie. Treat the local server as
+same-user, and do not run untrusted local web servers.
+
 Every `/ui/` response, including the `403` for a non-allowlisted peer and other
 error responses, sets `Content-Security-Policy` (`default-src 'none'`, script
 and style only from `'self'`, no `unsafe-inline`), `X-Content-Type-Options:

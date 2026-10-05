@@ -92,12 +92,29 @@
 
   // --- rendering ----------------------------------------------------------
 
+  // STATE_CLASS maps every state string the Go side can emit to its badge
+  // class. Keep it in sync: the guard test in webui_test.go fails when a state
+  // the Backend/Manager or agent can produce has no entry. Union of:
+  //   - agent API /v1/devices (internal/proto State*): unexported, exported,
+  //     in_use, absent, error
+  //   - agent reconciler states (internal/agent State.String): present,
+  //     binding, attached, backoff, quarantined
+  //   - Windows client supervisor states (internal/client State*): idle,
+  //     absent, attached, backoff, paused, network_down
   var STATE_CLASS = {
+    unexported: "badge-idle",
     exported: "badge-ok",
     in_use: "badge-ok",
-    unexported: "badge-idle",
     absent: "badge-idle",
-    error: "badge-error"
+    error: "badge-error",
+    present: "badge-idle",
+    binding: "badge-warn",
+    attached: "badge-ok",
+    backoff: "badge-warn",
+    quarantined: "badge-error",
+    idle: "badge-idle",
+    paused: "badge-idle",
+    network_down: "badge-error"
   };
 
   function text(tag, value) {

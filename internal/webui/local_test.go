@@ -3,6 +3,7 @@ package webui
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,12 +83,69 @@ func (b *fakeBackend) serverCalls() int {
 	return b.serverCall
 }
 
+// fakeClock is a mutex-guarded clock for tests whose background server probe
+// reads s.now concurrently.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock(t time.Time) *fakeClock { return &fakeClock{t: t} }
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// waitForServerView waits until the background probe has published a view.
+func waitForServerView(t *testing.T, s *LocalServer) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s.serversMu.Lock()
+		published := !s.serversAt.IsZero()
+		s.serversMu.Unlock()
+		if published {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("the background server probe never published a view")
+}
+
+// waitForServerCalls waits until Servers() has been called at least n times.
+func waitForServerCalls(t *testing.T, b *fakeBackend, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.serverCalls() >= n {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("Servers() called %d times, want at least %d", b.serverCalls(), n)
+}
+
 // startLocal binds the server to a real loopback port and serves it. The
 // returned httptest.Server owns the listener so ts.URL and the Host header the
 // server requires agree exactly.
 func startLocal(t *testing.T, b Backend, logs *LogRing) (*LocalServer, *httptest.Server) {
 	t.Helper()
-	s, err := NewLocal(LocalConfig{Backend: b, Logs: logs, Listen: "127.0.0.1:0"})
+	return startLocalCfg(t, LocalConfig{Backend: b, Logs: logs, Listen: "127.0.0.1:0"})
+}
+
+// startLocalCfg is startLocal with a caller-supplied LocalConfig, for tests
+// that need to set UnknownErr or another field.
+func startLocalCfg(t *testing.T, cfg LocalConfig) (*LocalServer, *httptest.Server) {
+	t.Helper()
+	s, err := NewLocal(cfg)
 	if err != nil {
 		t.Fatalf("NewLocal: %v", err)
 	}
@@ -214,9 +273,6 @@ func TestLocalRejectsPreflight(t *testing.T) {
 func TestLocalLoginBindsCodeToBrowser(t *testing.T) {
 	b := &fakeBackend{}
 	s, ts := startLocal(t, b, nil)
-	// This test is about binding, not rate limiting; do not let the thief's
-	// failed attempt throttle the owner.
-	s.login.interval = 0
 
 	code := s.codes.Issue()
 
@@ -361,43 +417,19 @@ func TestLocalLoginBodyIsCapped(t *testing.T) {
 	}
 }
 
-func TestLocalLoginRateLimit(t *testing.T) {
-	b := &fakeBackend{}
-	s, ts := startLocal(t, b, nil)
-	now := time.Unix(1000, 0)
-	s.login.now = func() time.Time { return now }
-
-	first := doPOST(t, newTestClient(), ts.URL+"/ui/login", url.Values{"code": {"wrong"}}, nil)
-	first.Body.Close()
-	if first.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("first failed attempt = %d, want 401", first.StatusCode)
-	}
-
-	immediate := doPOST(t, newTestClient(), ts.URL+"/ui/login", url.Values{"code": {"wrong"}}, nil)
-	immediate.Body.Close()
-	if immediate.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("immediate second attempt = %d, want 429", immediate.StatusCode)
-	}
-
-	now = now.Add(time.Second)
-	after := doPOST(t, newTestClient(), ts.URL+"/ui/login", url.Values{"code": {"wrong"}}, nil)
-	after.Body.Close()
-	if after.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("attempt after the limiter window = %d, want 401", after.StatusCode)
-	}
-}
-
 func TestLocalStateServesPinsAndCachesServers(t *testing.T) {
 	b := &fakeBackend{
 		pins:    []PinStatus{{Pin: "pi/xbox", Server: "pi", State: "attached", Port: 3}},
 		servers: []ServerStatus{{Name: "pi", Host: "pi.local", APIPort: 3241, Reachable: true, TokenValid: true}},
 	}
 	s, ts := startLocal(t, b, nil)
-	now := time.Unix(1000, 0)
-	s.now = func() time.Time { return now }
+	clock := newFakeClock(time.Unix(1000, 0))
+	s.now = clock.now
 	c := newTestClient()
 	login(t, s, ts, c)
 
+	// The pins are served immediately; the server view starts empty and is
+	// filled by the background probe (see the blocking test for the point).
 	resp := doGET(t, c, ts.URL+"/ui/api/state")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /ui/api/state = %d, want 200", resp.StatusCode)
@@ -410,19 +442,25 @@ func TestLocalStateServesPinsAndCachesServers(t *testing.T) {
 	if len(st.Pins) != 1 || st.Pins[0].Pin != "pi/xbox" || st.Pins[0].Port != 3 {
 		t.Fatalf("pins = %+v", st.Pins)
 	}
+
+	// Wait for the background probe to publish, then it is cached for the TTL.
+	waitForServerView(t, s)
+	resp = doGET(t, c, ts.URL+"/ui/api/state")
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	resp.Body.Close()
 	if len(st.Servers) != 1 || st.Servers[0].Name != "pi" {
 		t.Fatalf("servers = %+v", st.Servers)
 	}
-
-	// A second request inside the TTL must not probe again.
-	doGET(t, c, ts.URL+"/ui/api/state").Body.Close()
 	if got := b.serverCalls(); got != 1 {
 		t.Fatalf("Servers() called %d times inside the TTL, want 1", got)
 	}
 
-	// Past the TTL it probes again.
-	now = now.Add(serversCacheTTL + time.Second)
+	// Past the TTL it probes again, in the background.
+	clock.advance(serversCacheTTL + time.Second)
 	doGET(t, c, ts.URL+"/ui/api/state").Body.Close()
+	waitForServerCalls(t, b, 2)
 	if got := b.serverCalls(); got != 2 {
 		t.Fatalf("Servers() called %d times after the TTL, want 2", got)
 	}
@@ -587,4 +625,340 @@ func TestLocalStateJSONHasNoCredentialKeys(t *testing.T) {
 		}
 	}
 	walk("state", body)
+}
+
+// blockingBackend blocks in Servers() until release is closed, modelling a
+// probe against a powered-off Pi that does not answer until the per-client
+// timeout.
+type blockingBackend struct {
+	*fakeBackend
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+	calls   int32
+}
+
+func newBlockingBackend() *blockingBackend {
+	return &blockingBackend{
+		fakeBackend: &fakeBackend{
+			pins: []PinStatus{{Pin: "pi/xbox", Server: "pi", State: "attached", Port: 3}},
+		},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (b *blockingBackend) Servers() []ServerStatus {
+	atomic.AddInt32(&b.calls, 1)
+	b.once.Do(func() { close(b.started) })
+	<-b.release
+	return nil
+}
+
+func (b *blockingBackend) serverCalls() int { return int(atomic.LoadInt32(&b.calls)) }
+
+// TestLocalStateDoesNotBlockOnServerProbe is the regression for the state
+// endpoint queuing behind a server probe. Servers() blocks forever here; the
+// state request must still return promptly with the pins.
+func TestLocalStateDoesNotBlockOnServerProbe(t *testing.T) {
+	b := newBlockingBackend()
+	defer close(b.release)
+
+	s, ts := startLocal(t, b, nil)
+	c := newTestClient()
+	login(t, s, ts, c)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := c.Get(ts.URL + "/ui/api/state")
+		done <- result{resp, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("GET /ui/api/state: %v", r.err)
+		}
+		defer r.resp.Body.Close()
+		if r.resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /ui/api/state = %d, want 200", r.resp.StatusCode)
+		}
+		var st LocalState
+		if err := json.NewDecoder(r.resp.Body).Decode(&st); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(st.Pins) != 1 || st.Pins[0].Pin != "pi/xbox" {
+			t.Fatalf("pins = %+v, want the pin served despite the blocked probe", st.Pins)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET /ui/api/state blocked on the server probe")
+	}
+
+	// The probe runs off the request path, so it did start (and is blocked).
+	select {
+	case <-b.started:
+	case <-time.After(time.Second):
+		t.Fatal("the background server probe never started")
+	}
+}
+
+// TestLocalServerProbeIsSingleFlight: a burst of state requests must not start
+// more than one probe.
+func TestLocalServerProbeIsSingleFlight(t *testing.T) {
+	b := newBlockingBackend()
+	defer close(b.release)
+
+	s, ts := startLocal(t, b, nil)
+	c := newTestClient()
+	login(t, s, ts, c)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := c.Get(ts.URL + "/ui/api/state")
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Give a wrong implementation a chance to start extra probes.
+	time.Sleep(50 * time.Millisecond)
+	if got := b.serverCalls(); got != 1 {
+		t.Fatalf("Servers() called %d times for a burst, want 1 (single-flight)", got)
+	}
+}
+
+func TestOriginMatchesHost(t *testing.T) {
+	const host = "127.0.0.1:54321"
+	cases := []struct {
+		name   string
+		origin string
+		ref    string
+		want   bool
+	}{
+		{"no origin or referer", "", "", true},
+		{"matching origin", "http://" + host, "", true},
+		{"matching origin is case-insensitive", "http://127.0.0.1:54321", "", true},
+		{"mismatching origin", "http://evil.example", "", false},
+		{"origin null", "null", "", false},
+		{"matching referer fallback", "", "http://" + host + "/ui/login", true},
+		{"mismatching referer fallback", "", "http://evil.example/ui/login", false},
+		{"malformed origin", "http://[::1", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "http://example/", nil)
+			req.Host = host
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.ref != "" {
+				req.Header.Set("Referer", tc.ref)
+			}
+			if got := originMatchesHost(req); got != tc.want {
+				t.Errorf("originMatchesHost = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOneTimeCodesBindRedeemBound(t *testing.T) {
+	c := NewOneTimeCodes()
+
+	code := c.Issue()
+	if !c.Bind(code, "browser-a") {
+		t.Fatal("Bind(code, browser-a) = false, want true")
+	}
+	// A second browser cannot claim an already-bound code.
+	if c.Bind(code, "browser-b") {
+		t.Error("Bind(code, browser-b) = true, want false")
+	}
+	// A cookie belonging to a different code is rejected.
+	other := c.Issue()
+	if !c.Bind(other, "browser-b") {
+		t.Fatal("Bind(other, browser-b) = false, want true")
+	}
+	if c.RedeemBound(code, "browser-b") {
+		t.Error("RedeemBound(code, browser-b) = true, want false")
+	}
+	if c.RedeemBound(other, "browser-a") {
+		t.Error("RedeemBound(other, browser-a) = true, want false")
+	}
+	// The owner redeems exactly once.
+	if !c.RedeemBound(code, "browser-a") {
+		t.Fatal("RedeemBound(code, browser-a) = false, want true")
+	}
+	if c.RedeemBound(code, "browser-a") {
+		t.Error("second RedeemBound(code, browser-a) = true, want single use")
+	}
+	// An unbound code cannot be redeemed by anyone.
+	unbound := c.Issue()
+	if c.RedeemBound(unbound, "browser-a") {
+		t.Error("RedeemBound(unbound code) = true, want false")
+	}
+}
+
+// TestOneTimeCodesConcurrentRedeemAdmitsOne: concurrent redemptions of one bound
+// code must admit exactly one winner.
+func TestOneTimeCodesConcurrentRedeemAdmitsOne(t *testing.T) {
+	c := NewOneTimeCodes()
+	code := c.Issue()
+	if !c.Bind(code, "browser-a") {
+		t.Fatal("Bind failed")
+	}
+
+	const n = 32
+	var wins int32
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if c.RedeemBound(code, "browser-a") {
+				atomic.AddInt32(&wins, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("concurrent RedeemBound admitted %d winners, want exactly 1", wins)
+	}
+}
+
+func TestLocalHostCheckVariants(t *testing.T) {
+	s, err := NewLocal(LocalConfig{Backend: &fakeBackend{}, Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatalf("NewLocal: %v", err)
+	}
+	setAddr := func(a string) {
+		s.mu.Lock()
+		s.addr = a
+		s.mu.Unlock()
+	}
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	h := s.security(next)
+
+	cases := []struct {
+		name string
+		addr string
+		host string
+		want int
+	}{
+		{"exact bound host", "127.0.0.1:54321", "127.0.0.1:54321", http.StatusOK},
+		{"localhost name is not the bound address", "127.0.0.1:54321", "localhost:54321", http.StatusForbidden},
+		{"wrong port", "127.0.0.1:54321", "127.0.0.1:54322", http.StatusForbidden},
+		{"case-insensitive match", "ExampleHost:54321", "examplehost:54321", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setAddr(tc.addr)
+			req := httptest.NewRequest(http.MethodGet, "http://example/", nil)
+			req.Host = tc.host
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Errorf("Host %q with addr %q = %d, want %d", tc.host, tc.addr, rec.Code, tc.want)
+			}
+		})
+	}
+}
+
+func assertHardeningHeaders(t *testing.T, resp *http.Response) {
+	t.Helper()
+	want := map[string]string{
+		"Content-Security-Policy": localCSP,
+		"X-Content-Type-Options":  "nosniff",
+		"X-Frame-Options":         "DENY",
+		"Referrer-Policy":         "no-referrer",
+	}
+	for k, v := range want {
+		if got := resp.Header.Get(k); got != v {
+			t.Errorf("%s = %q, want %q", k, got, v)
+		}
+	}
+}
+
+// TestLocalEarlyForbiddenCarriesHardeningHeaders: the 403s written by the
+// security wrapper before a handler runs must still carry the hardening
+// headers.
+func TestLocalEarlyForbiddenCarriesHardeningHeaders(t *testing.T) {
+	b := &fakeBackend{}
+	_, ts := startLocal(t, b, nil)
+
+	// Foreign Host.
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/ui/login", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Host = "evil.example"
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("foreign Host request: %v", err)
+	}
+	assertHardeningHeaders(t, resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign Host = %d, want 403", resp.StatusCode)
+	}
+
+	// CORS preflight.
+	req, err = http.NewRequest(http.MethodOptions, ts.URL+"/ui/api/state", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight request: %v", err)
+	}
+	assertHardeningHeaders(t, resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("preflight = %d, want 403", resp.StatusCode)
+	}
+
+	// Cross-origin GET.
+	req, err = http.NewRequest(http.MethodGet, ts.URL+"/ui/login", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Origin", "http://evil.example")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("cross-origin request: %v", err)
+	}
+	assertHardeningHeaders(t, resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin = %d, want 403", resp.StatusCode)
+	}
+}
+
+// TestLocalUnknownPinReturns404: a Backend "unknown pin" sentinel maps to 404,
+// matching the Pi-side API, rather than 500.
+func TestLocalUnknownPinReturns404(t *testing.T) {
+	sentinel := errors.New("unknown pin")
+	b := &fakeBackend{attachErr: sentinel}
+	s, ts := startLocalCfg(t, LocalConfig{
+		Backend:    b,
+		Listen:     "127.0.0.1:0",
+		UnknownErr: sentinel,
+	})
+	c := newTestClient()
+	login(t, s, ts, c)
+
+	resp := doPOST(t, c, ts.URL+"/ui/api/pins/pi/nope/attach", nil,
+		map[string]string{CSRFHeader: CSRFHeaderValue})
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown pin attach = %d, want 404 (body %s)", resp.StatusCode, body)
+	}
 }

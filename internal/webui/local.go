@@ -33,13 +33,6 @@ const LoginCookieName = "yab_login"
 // unauthenticated caller and must not be buffered.
 const maxLocalLoginBody = 4 << 10
 
-// maxLoginPeers caps the per-peer login limiter table. The local server only
-// ever sees loopback peers, but the table is still bounded so a burst cannot
-// grow it without limit. The algorithm mirrors internal/api/ui.go; webui cannot
-// import internal/api (api imports webui) and this must not be a weaker
-// limiter, so it is reproduced here rather than replaced with a global one.
-const maxLoginPeers = 1024
-
 // serversCacheTTL is how long the server/reachability view is reused before it
 // is probed again. Probing a server means opening a TCP connection and an HTTP
 // request, so a page load (or a client that reloads in a loop) must not trigger
@@ -124,6 +117,10 @@ type LocalConfig struct {
 	// Listen is the loopback bind address, normally 127.0.0.1:0. A non-loopback
 	// host is rejected.
 	Listen string
+	// UnknownErr is the sentinel a Backend uses to signal "unknown pin". It is
+	// wired at construction so this package never imports internal/client; a
+	// pin action returning it maps to 404 rather than 500.
+	UnknownErr error
 	// Log receives request errors. May be nil.
 	Log *slog.Logger
 }
@@ -136,10 +133,11 @@ type LocalServer struct {
 	backend Backend
 	logs    *LogRing
 	log     *slog.Logger
+	// unknownErr is the Backend's "unknown pin" sentinel; see LocalConfig.
+	unknownErr error
 
 	sessions *Sessions
 	codes    *OneTimeCodes
-	login    *loginLimiter
 
 	listen string
 	now    func() time.Time
@@ -150,9 +148,16 @@ type LocalServer struct {
 	mu   sync.Mutex
 	addr string
 
+	// servers is the last server/reachability view, guarded by serversMu. A
+	// probe can take tens of seconds when a Pi is off, so it is never run
+	// while holding serversMu and never on the request path: cachedServers
+	// returns the last view immediately and kicks a single background refresh
+	// when it is stale. probing is true while that refresh is in flight, which
+	// keeps concurrent requests from piling up probes.
 	serversMu sync.Mutex
 	servers   []ServerStatus
 	serversAt time.Time
+	probing   bool
 
 	handler http.Handler
 	http    *http.Server
@@ -173,16 +178,16 @@ func NewLocal(cfg LocalConfig) (*LocalServer, error) {
 	}
 
 	s := &LocalServer{
-		backend:   cfg.Backend,
-		logs:      cfg.Logs,
-		log:       cfg.Log,
-		sessions:  NewSessions(),
-		codes:     NewOneTimeCodes(),
-		login:     newLoginLimiter(),
-		listen:    listen,
-		now:       time.Now,
-		sseTick:   defaultSSETick,
-		keepAlive: defaultSSEKeepAlive,
+		backend:    cfg.Backend,
+		logs:       cfg.Logs,
+		log:        cfg.Log,
+		unknownErr: cfg.UnknownErr,
+		sessions:   NewSessions(),
+		codes:      NewOneTimeCodes(),
+		listen:     listen,
+		now:        time.Now,
+		sseTick:    defaultSSETick,
+		keepAlive:  defaultSSEKeepAlive,
 	}
 
 	mux := http.NewServeMux()
@@ -267,17 +272,40 @@ func (s *LocalServer) state() LocalState {
 	return LocalState{Pins: s.backend.Status(), Servers: s.cachedServers()}
 }
 
-// cachedServers returns the server view, refreshing it at most once every
-// serversCacheTTL so a page load cannot trigger repeated network probes.
+// cachedServers returns the most recent server view immediately, refreshing it
+// in the background when it is older than serversCacheTTL. It never probes on
+// the request path: probing a powered-off Pi blocks for the per-client timeout,
+// so holding a lock (or the request) across it would stall every /ui/api/state
+// call, which is the page's only data source. The first calls after startup
+// return an empty view; the next request (or the client's SSE refresh) sees the
+// populated one. At most one probe runs at a time, so a burst of requests
+// cannot pile them up.
 func (s *LocalServer) cachedServers() []ServerStatus {
 	s.serversMu.Lock()
-	defer s.serversMu.Unlock()
-	now := s.now()
-	if s.serversAt.IsZero() || now.Sub(s.serversAt) >= serversCacheTTL {
-		s.servers = s.backend.Servers()
-		s.serversAt = now
+	view := s.servers
+	stale := s.serversAt.IsZero() || s.now().Sub(s.serversAt) >= serversCacheTTL
+	start := stale && !s.probing
+	if start {
+		s.probing = true
 	}
-	return s.servers
+	s.serversMu.Unlock()
+
+	if start {
+		go s.refreshServers()
+	}
+	return view
+}
+
+// refreshServers probes the backend off the request path and publishes the
+// result. It runs in a single goroutine per stale window (cachedServers sets
+// probing before starting it).
+func (s *LocalServer) refreshServers() {
+	view := s.backend.Servers()
+	s.serversMu.Lock()
+	s.servers = view
+	s.serversAt = s.now()
+	s.probing = false
+	s.serversMu.Unlock()
 }
 
 // security is the outermost wrapper: it rejects a Host header that does not
@@ -286,6 +314,14 @@ func (s *LocalServer) cachedServers() []ServerStatus {
 // browser hardening headers to every response including errors.
 func (s *LocalServer) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set the hardening headers before any early rejection so the 403s for
+		// a bad Host, a preflight and a cross-origin request carry them too.
+		h := w.Header()
+		h.Set("Content-Security-Policy", localCSP)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+
 		if r.Host == "" || !strings.EqualFold(r.Host, s.Addr()) {
 			http.Error(w, "forbidden: unexpected Host header", http.StatusForbidden)
 			return
@@ -299,11 +335,6 @@ func (s *LocalServer) security(next http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "forbidden", "cross-origin request refused")
 			return
 		}
-		h := w.Header()
-		h.Set("Content-Security-Policy", localCSP)
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("X-Frame-Options", "DENY")
-		h.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -398,23 +429,20 @@ func (s *LocalServer) handleLoginSubmit(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	peer := s.peerKey(r)
-	if !s.login.allow(peer) {
-		_ = RenderLogin(w, LoginPage{Local: true, Error: "Too many attempts. Wait a second and try again."}, http.StatusTooManyRequests)
-		return
-	}
+	// There is deliberately no rate limiter here. Every peer is loopback, so a
+	// per-peer limiter is global: one misbehaving local process could hold the
+	// real user in a 429 window (and the 429 page has no form, forcing a reopen
+	// from the tray). A code is 256-bit, single-use, browser-bound and expires
+	// in 60s, so guessing is infeasible and the limiter protected nothing.
 
 	binding := ""
 	if cookie, err := r.Cookie(LoginCookieName); err == nil {
 		binding = cookie.Value
 	}
 	if binding == "" || !s.codes.RedeemBound(r.PostFormValue("code"), binding) {
-		// A wrong or expired code is the failure the limiter records; do not
-		// clear it.
 		_ = RenderLogin(w, LoginPage{Local: true, Error: expiredLoginMessage}, http.StatusUnauthorized)
 		return
 	}
-	s.login.succeed(peer)
 
 	id := s.sessions.Create()
 	SetCookie(w, id, SessionTTL)
@@ -461,6 +489,11 @@ func (s *LocalServer) handleDetach(w http.ResponseWriter, r *http.Request) {
 func (s *LocalServer) pinAction(w http.ResponseWriter, r *http.Request, action func(string) error, status string) {
 	pin := r.PathValue("server") + "/" + r.PathValue("device")
 	if err := action(pin); err != nil {
+		// An unknown pin is a client error, matching the Pi-side API's 404.
+		if s.unknownErr != nil && errors.Is(err, s.unknownErr) {
+			writeError(w, http.StatusNotFound, "not_found", "unknown device")
+			return
+		}
 		// Log the detail; never return it to the caller.
 		if s.log != nil {
 			s.log.Warn("webui: pin action failed", "pin", pin, "err", err)
@@ -572,15 +605,6 @@ func (s *LocalServer) handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// peerKey names the connection peer for the per-peer login limiter.
-func (s *LocalServer) peerKey(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
 // setLoginCookie writes the short-lived binding cookie. It is HttpOnly and
 // SameSite=Strict so a cross-site request neither reads nor carries it.
 func setLoginCookie(w http.ResponseWriter, value string) {
@@ -679,62 +703,4 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}{Code: code, Message: message})
-}
-
-// loginLimiter enforces a per-peer "one login attempt per second" rate. It
-// mirrors internal/api/ui.go: a peer is reserved on entry, so a concurrent
-// burst cannot all pass before the first failure registers, and a valid code
-// clears the reservation. The table is bounded with oldest-entry eviction.
-type loginLimiter struct {
-	mu       sync.Mutex
-	interval time.Duration
-	max      int
-	now      func() time.Time
-	last     map[string]time.Time
-}
-
-func newLoginLimiter() *loginLimiter {
-	return &loginLimiter{
-		interval: time.Second,
-		max:      maxLoginPeers,
-		now:      time.Now,
-		last:     make(map[string]time.Time),
-	}
-}
-
-// allow reports whether an attempt from peer may proceed, recording it in the
-// same critical section.
-func (l *loginLimiter) allow(peer string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := l.now()
-	if last, ok := l.last[peer]; ok {
-		if now.Sub(last) < l.interval {
-			return false
-		}
-	} else if len(l.last) >= l.max {
-		l.evictOldestLocked()
-	}
-	l.last[peer] = now
-	return true
-}
-
-// succeed clears a peer's reservation after a valid code.
-func (l *loginLimiter) succeed(peer string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.last, peer)
-}
-
-// evictOldestLocked drops the entry with the oldest timestamp. The caller must
-// hold l.mu.
-func (l *loginLimiter) evictOldestLocked() {
-	oldest := ""
-	var at time.Time
-	for peer, t := range l.last {
-		if oldest == "" || t.Before(at) {
-			oldest, at = peer, t
-		}
-	}
-	delete(l.last, oldest)
 }

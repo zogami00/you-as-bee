@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 
 	"github.com/zogami00/you-as-bee/internal/client"
@@ -85,10 +87,11 @@ func (b webBackend) Detach(pin string) error {
 // matters when Listen asked for port 0) and serves in the background.
 func startLocalWebUI(cfg config.ClientConfig, backend webui.Backend, logs *webui.LogRing, logger *slog.Logger) (*webui.LocalServer, error) {
 	srv, err := webui.NewLocal(webui.LocalConfig{
-		Backend: backend,
-		Logs:    logs,
-		Listen:  cfg.WebUI.Listen,
-		Log:     logger,
+		Backend:    backend,
+		Logs:       logs,
+		Listen:     cfg.WebUI.Listen,
+		UnknownErr: client.ErrUnknownPin,
+		Log:        logger,
 	})
 	if err != nil {
 		return nil, err
@@ -115,22 +118,43 @@ func (t *trayController) OpenUI() error {
 		return errors.New("web UI is not running (check web_ui.enabled in client.json)")
 	}
 	rawURL := t.web.NewLoginURL()
-	if err := openUI(rawURL); err != nil {
-		// Fall back to making the URL available rather than failing the tray:
-		// log it and put it in the error so the menu can show it.
+	if err := launchBrowser(rawURL); err != nil {
+		// Fall back to making the base URL available rather than failing the
+		// tray: log it and put it in the error, but never the live one-time
+		// code. The code is a credential for the 60s login window, and both
+		// the log ring (GET /ui/api/logs) and the tray status title are
+		// readable by anything that can see them. The base URL is enough for
+		// the user to reopen the UI from the tray.
+		base := t.web.BaseURL()
 		if t.log != nil {
-			t.log.Warn("could not open a browser; open this URL manually", "url", rawURL, "err", err)
+			t.log.Warn("could not open a browser; open the web UI again from the tray", "url", base, "err", err)
 		}
-		return fmt.Errorf("could not open a browser; open %s manually: %w", rawURL, err)
+		return fmt.Errorf("could not open a browser at %s; open the web UI again from the tray: %w", base, err)
 	}
 	return nil
+}
+
+// launchBrowser opens rawURL. It is a package variable so tests can force a
+// launch failure without starting a browser.
+var launchBrowser = openUI
+
+// explorerPath returns the absolute path of explorer.exe under %SystemRoot%.
+// An elevated process must not resolve explorer.exe through PATH (which can
+// include a writable directory), mirroring the absolute pnputil.exe path in
+// internal/usbipwin.
+func explorerPath() string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return filepath.Join(root, "explorer.exe")
 }
 
 // openUI starts explorer.exe with the URL. explorer.exe hands the URL to the
 // shell's already-running (unelevated) process, so the browser starts with the
 // user's normal token. It does not wait for the browser.
 func openUI(rawURL string) error {
-	cmd := exec.Command("explorer.exe", rawURL)
+	cmd := exec.Command(explorerPath(), rawURL)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
