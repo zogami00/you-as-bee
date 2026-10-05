@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/identity"
@@ -436,6 +438,13 @@ func (r *Reconciler) failLocked(pin string, rec *record, now time.Time, err erro
 	r.warnf("pin %q failed, retrying in %s", pin, delay)
 }
 
+// safeReasonRe matches a path-like token anywhere in a message: a leading slash
+// at the start of the string or after a non-alphanumeric boundary, followed by
+// at least one path character. Matching anywhere, rather than only a
+// whitespace-delimited first field, catches quoted, delimited and embedded
+// paths such as `open "/sys/x"`, `(/sys/x)` or `path=/sys/x`.
+var safeReasonRe = regexp.MustCompile(`(^|[^[:alnum:]])/[^\s,;)"'\]}]+`)
+
 // safeReason reduces an internal bind/unbind error to a short reason that is
 // safe to expose through proto.Device.LastError (and therefore /v1/devices,
 // SSE and the UI). A message that names a filesystem path is replaced with a
@@ -455,15 +464,22 @@ func safeReason(msg string) string {
 		}
 		return r
 	}, msg)
-	for _, field := range strings.Fields(msg) {
-		if strings.HasPrefix(field, "/") {
-			return "operation failed"
-		}
+	if safeReasonRe.MatchString(msg) {
+		return "operation failed"
 	}
-	if len(msg) > 200 {
-		msg = msg[:200]
+	return truncateRunes(msg, 200)
+}
+
+// truncateRunes returns the longest prefix of s that is at most max bytes and
+// does not split a UTF-8 rune.
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	return msg
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // rebuildSnapshotLocked republishes the device snapshot and emits events for

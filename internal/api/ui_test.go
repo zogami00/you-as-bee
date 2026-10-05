@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -343,21 +344,43 @@ func TestUIRouteRejectsNonAllowlistedEvenWithSession(t *testing.T) {
 	}
 }
 
-// TestUISecurityHeaders checks the browser hardening applied to UI responses.
+// TestUISecurityHeaders checks the browser hardening applied to UI responses,
+// including the allowlist 403 for a disallowed peer: the header wrapper is
+// outermost, so an error response carries them too.
 func TestUISecurityHeaders(t *testing.T) {
 	srv := newWebUIServer(t, true)
-	for _, target := range []string{"/ui/login", "/ui/assets/app.js"} {
-		rec := doUI(t, srv, http.MethodGet, target, nil, "", nil)
-		h := rec.Result().Header
-		if got := h.Get("Content-Security-Policy"); got == "" || strings.Contains(got, "unsafe-inline") {
-			t.Errorf("%s Content-Security-Policy = %q", target, got)
-		}
-		if h.Get("X-Content-Type-Options") != "nosniff" {
-			t.Errorf("%s X-Content-Type-Options = %q, want nosniff", target, h.Get("X-Content-Type-Options"))
-		}
-		if h.Get("X-Frame-Options") != "DENY" {
-			t.Errorf("%s X-Frame-Options = %q, want DENY", target, h.Get("X-Frame-Options"))
-		}
+	const outside = "203.0.113.9:1234"
+	cases := []struct {
+		name       string
+		target     string
+		remoteAddr string
+		wantStatus int
+	}{
+		{"login", "/ui/login", "10.0.0.5:1234", http.StatusOK},
+		{"asset", "/ui/assets/app.js", "10.0.0.5:1234", http.StatusOK},
+		{"allowlist 403", "/ui/login", outside, http.StatusForbidden},
+		{"unknown ui path from disallowed peer", "/ui/does-not-exist", outside, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doUIFrom(t, srv, http.MethodGet, tc.target, nil, tc.remoteAddr, "", nil)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("GET %s from %s = %d, want %d", tc.target, tc.remoteAddr, rec.Code, tc.wantStatus)
+			}
+			h := rec.Result().Header
+			if got := h.Get("Content-Security-Policy"); got == "" || strings.Contains(got, "unsafe-inline") {
+				t.Errorf("%s Content-Security-Policy = %q", tc.target, got)
+			}
+			if h.Get("X-Content-Type-Options") != "nosniff" {
+				t.Errorf("%s X-Content-Type-Options = %q, want nosniff", tc.target, h.Get("X-Content-Type-Options"))
+			}
+			if h.Get("X-Frame-Options") != "DENY" {
+				t.Errorf("%s X-Frame-Options = %q, want DENY", tc.target, h.Get("X-Frame-Options"))
+			}
+			if h.Get("Referrer-Policy") != "no-referrer" {
+				t.Errorf("%s Referrer-Policy = %q, want no-referrer", tc.target, h.Get("Referrer-Policy"))
+			}
+		})
 	}
 }
 
@@ -468,6 +491,76 @@ func TestLogsEndpointRedactsPaths(t *testing.T) {
 	}
 	if strings.Contains(resp.Entries[0].Attrs["path"], "/sys/") {
 		t.Errorf("log attrs leaked a sysfs path: %q", resp.Entries[0].Attrs["path"])
+	}
+}
+
+// TestLogsEndpointConcurrentReadsDoNotMutateRingAttrs drives many concurrent
+// /v1/logs requests over entries that carry Attrs maps. Entries returns the
+// ring's own Attrs maps by reference, so an implementation that redacts in
+// place is a concurrent map write; Go aborts the whole process on one, and
+// net/http cannot recover it. This asserts correctness and, under CI's -race
+// (the race detector needs cgo, unavailable locally with CGO_ENABLED=0), would
+// also flag the in-place mutation. The final check proves redaction never
+// writes through to ring storage.
+func TestLogsEndpointConcurrentReadsDoNotMutateRingAttrs(t *testing.T) {
+	ring := webui.NewLogRing()
+	logger := slog.New(ring)
+	for i := 0; i < 50; i++ {
+		logger.Info("bind failed", "path", fmt.Sprintf("/sys/bus/usb/devices/1-1.%d", i))
+	}
+
+	srv, err := New(Config{
+		Token:          testToken,
+		AllowedClients: []string{"10.0.0.0/8"},
+		Backend:        &fakeBackend{},
+		Logs:           ring,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const goroutines = 8
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 25; i++ {
+				rec := request(t, srv, http.MethodGet, "/v1/logs?limit=500", "10.0.0.5:1234", testToken, nil)
+				if rec.Code != http.StatusOK {
+					t.Errorf("GET /v1/logs = %d, want 200", rec.Code)
+					return
+				}
+				var resp proto.LogsResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					t.Errorf("decode: %v", err)
+					return
+				}
+				for _, e := range resp.Entries {
+					if strings.Contains(e.Msg, "/sys/") {
+						t.Errorf("log message leaked a sysfs path: %q", e.Msg)
+						return
+					}
+					for k, v := range e.Attrs {
+						if strings.Contains(v, "/sys/") {
+							t.Errorf("attr %q leaked a sysfs path: %q", k, v)
+							return
+						}
+					}
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	// The ring's stored map must still hold the original path: redaction is
+	// per response, never in storage.
+	stored := ring.Entries(0, 1)
+	if len(stored.Entries) != 1 || !strings.Contains(stored.Entries[0].Attrs["path"], "/sys/") {
+		t.Fatalf("ring storage was mutated by a reader: %+v", stored.Entries)
 	}
 }
 

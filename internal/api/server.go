@@ -71,18 +71,51 @@ type Server struct {
 	// nothing in this binary calls Issue or Redeem. The table is bounded.
 	codes   *webui.OneTimeCodes
 	login   *loginLimiter
-	mux     *http.ServeMux
+	mux     *routeMux
 	handler http.Handler
 	// guardedRoutes records every /v1 route, as "METHOD /pattern". Tests
 	// enumerate it so a new guarded route cannot be added without being
 	// covered.
 	guardedRoutes []string
 	// allRoutes records every pattern registered on the mux, including the
-	// public and UI routes, as "METHOD /pattern". Tests enumerate it to assert
-	// that every registered route is either explicitly public (/healthz) or
-	// rejects a non-allowlisted peer.
+	// public and UI routes, as "METHOD /pattern". It is populated by routeMux
+	// on every registration, not maintained by hand, so tests enumerate the
+	// routes that are actually registered.
 	allRoutes []string
 	http      *http.Server
+}
+
+// routeMux is the mux registration path for the API. Every pattern registered
+// through Handle or HandleFunc is appended to routes, so
+// TestEveryRegisteredRouteIsPublicOrAllowlisted enumerates the routes that are
+// actually registered rather than a hand-maintained list. The underlying
+// http.ServeMux is unexported and reachable only through Handle/HandleFunc, so
+// the normal way to add a route also records it.
+type routeMux struct {
+	inner  *http.ServeMux
+	routes *[]string
+}
+
+// newRouteMux returns a routeMux that records each registered pattern in
+// routes.
+func newRouteMux(routes *[]string) *routeMux {
+	return &routeMux{inner: http.NewServeMux(), routes: routes}
+}
+
+// Handle registers pattern and records it.
+func (m *routeMux) Handle(pattern string, handler http.Handler) {
+	m.inner.Handle(pattern, handler)
+	*m.routes = append(*m.routes, pattern)
+}
+
+// HandleFunc registers pattern and records it.
+func (m *routeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.Handle(pattern, handler)
+}
+
+// ServeHTTP implements http.Handler.
+func (m *routeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.inner.ServeHTTP(w, r)
 }
 
 // New builds a Server from cfg.
@@ -97,8 +130,8 @@ func New(cfg Config) (*Server, error) {
 		sessions:   webui.NewSessions(),
 		codes:      webui.NewOneTimeCodes(),
 		login:      newLoginLimiter(),
-		mux:        http.NewServeMux(),
 	}
+	s.mux = newRouteMux(&s.allRoutes)
 	for _, cidr := range cfg.AllowedClients {
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -108,7 +141,6 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
-	s.allRoutes = append(s.allRoutes, "GET /healthz")
 	// Every guarded route is registered from this table, which is also what
 	// TestEveryGuardedRouteRequiresToken enumerates. The handlers are not
 	// wrapped individually: the front door (see frontDoor) applies guard to
@@ -132,7 +164,6 @@ func New(cfg Config) (*Server, error) {
 		pattern := rt.method + " " + rt.pattern
 		s.mux.Handle(pattern, rt.handler)
 		s.guardedRoutes = append(s.guardedRoutes, pattern)
-		s.allRoutes = append(s.allRoutes, pattern)
 	}
 
 	if cfg.WebUI {
@@ -155,7 +186,6 @@ func New(cfg Config) (*Server, error) {
 		}
 		for _, rt := range ui {
 			s.mux.Handle(rt.pattern, rt.handler)
-			s.allRoutes = append(s.allRoutes, rt.pattern)
 		}
 	}
 
@@ -206,7 +236,10 @@ const uiCSP = "default-src 'none'; script-src 'self'; style-src 'self'; " +
 //   - everything else goes through guard (allowlist + bearer token or session
 //     cookie), so a route registered directly on the mux is still guarded.
 func (s *Server) frontDoor(next http.Handler) http.Handler {
-	ui := s.allowOnly(uiSecurityHeaders(next))
+	// The hardening headers are applied outermost so that every /ui/ response
+	// carries them, including the 403 allowOnly writes for a disallowed peer
+	// and any other error response.
+	ui := uiSecurityHeaders(s.allowOnly(next))
 	guarded := s.guard(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -365,11 +398,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	var sessionID string
 	var sessionDone <-chan struct{}
 	if !s.tokenOK(r) {
-		if cookie, err := r.Cookie(webui.SessionCookieName); err == nil && cookie.Value != "" {
-			if done, ok := s.sessions.Watch(cookie.Value); ok {
-				sessionID, sessionDone = cookie.Value, done
-			}
+		// Reaching here means guard authenticated this request with a session
+		// cookie rather than a bearer token. Watch must confirm the session
+		// before the stream starts: if the session was deleted or evicted
+		// between guard's Validate and now, streaming with no watcher would
+		// keep delivering events to an ended session until the client
+		// disconnects.
+		cookie, err := r.Cookie(webui.SessionCookieName)
+		if err != nil || cookie.Value == "" {
+			return
 		}
+		done, ok := s.sessions.Watch(cookie.Value)
+		if !ok {
+			return
+		}
+		sessionID, sessionDone = cookie.Value, done
 	}
 
 	events, cancel := s.backend.Subscribe(r.Context())
@@ -427,25 +470,56 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	// example a failed bind's write target). backendError deliberately redacts
 	// exactly that detail, so redact it here too. The console/journald copy is
 	// untouched.
+	//
+	// Entries returns each entry's Attrs map by reference, so the ring's map is
+	// shared with this response. Redact into a fresh map rather than writing
+	// through the shared one: a concurrent /v1/logs request doing the same
+	// would be a concurrent map write, which Go aborts the whole process on.
 	for i := range resp.Entries {
 		resp.Entries[i].Msg = redactPaths(resp.Entries[i].Msg)
-		for k, v := range resp.Entries[i].Attrs {
-			resp.Entries[i].Attrs[k] = redactPaths(v)
-		}
+		resp.Entries[i].Attrs = redactAttrs(resp.Entries[i].Attrs)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// pathTokenRe matches an absolute-looking path token. It is used to redact
-// filesystem detail from the /v1/logs mirror.
-var pathTokenRe = regexp.MustCompile(`/[^\s,;]+`)
+// pathTokenRe matches a path-like token: a leading slash that is at the start
+// of the string or follows a non-alphanumeric boundary, followed by at least
+// one path character. Anchoring the leading slash is what keeps a bare slash
+// used as a conjunction ("and/or", "24/7") from being mangled.
+var pathTokenRe = regexp.MustCompile(`(^|[^[:alnum:]])/[^\s,;)"'\]}]+`)
 
-// redactPaths replaces path-like tokens with a fixed marker.
+// redactPaths replaces path-like tokens with a fixed marker. It returns s
+// unchanged when no token changes.
 func redactPaths(s string) string {
 	if !strings.Contains(s, "/") {
 		return s
 	}
-	return pathTokenRe.ReplaceAllString(s, "[redacted]")
+	return pathTokenRe.ReplaceAllString(s, "${1}[redacted]")
+}
+
+// redactAttrs returns a map with every value redacted, or the input map
+// unchanged when no value changes. It never mutates the input map: that map is
+// owned by the log ring and may be read concurrently by other /v1/logs
+// requests.
+func redactAttrs(attrs map[string]string) map[string]string {
+	if len(attrs) == 0 {
+		return attrs
+	}
+	changed := false
+	for _, v := range attrs {
+		if redactPaths(v) != v {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return attrs
+	}
+	redacted := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		redacted[k] = redactPaths(v)
+	}
+	return redacted
 }
 
 func (s *Server) backendError(w http.ResponseWriter, err error) {

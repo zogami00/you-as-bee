@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/proto"
@@ -878,6 +879,49 @@ func TestLastErrorRedactsFilesystemPaths(t *testing.T) {
 	}
 	if strings.Contains(got, "/") {
 		t.Errorf("LastError leaked a filesystem path: %q", got)
+	}
+}
+
+// TestSafeReasonRedactsPathsAnywhere covers the shapes the old first-field
+// heuristic missed: a quoted, parenthesised or '='-delimited path that does not
+// begin a whitespace-delimited field.
+func TestSafeReasonRedactsPathsAnywhere(t *testing.T) {
+	leaky := []string{
+		`usbiphost: open "/sys/bus/usb/devices/1-1.2/idVendor": permission denied`,
+		`write failed (/sys/bus/usb/drivers/usbip-host/bind)`,
+		`path=/sys/bus/usb/devices/1-1.2`,
+		`/sys/bus/usb/devices/1-1.2`,
+	}
+	for _, msg := range leaky {
+		if got := safeReason(msg); strings.Contains(got, "/") {
+			t.Errorf("safeReason(%q) = %q, leaked a path", msg, got)
+		}
+	}
+}
+
+// TestSafeReasonKeepsShortPathFreeMessages: an ordinary error keeps its useful
+// text, and a slash used as a conjunction is not treated as a path.
+func TestSafeReasonKeepsShortPathFreeMessages(t *testing.T) {
+	for _, msg := range []string{"permission denied", "read/write failed", "and/or"} {
+		if got := safeReason(msg); got != msg {
+			t.Errorf("safeReason(%q) = %q, want the message preserved", msg, got)
+		}
+	}
+}
+
+// TestSafeReasonTruncatesOnRuneBoundary: the 200-byte cap must not split a
+// multi-byte rune.
+func TestSafeReasonTruncatesOnRuneBoundary(t *testing.T) {
+	msg := strings.Repeat("\u20ac", 100) // 300 bytes, so a 200-byte cut is mid-rune
+	got := safeReason(msg)
+	if !utf8.ValidString(got) {
+		t.Fatalf("safeReason produced invalid UTF-8 (len %d)", len(got))
+	}
+	if len(got) > 200 {
+		t.Fatalf("safeReason len = %d, want <= 200", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("safeReason returned empty")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -389,11 +390,22 @@ func TestEmbeddedAssetsContainNoBrowserStorageOrTokenAPIs(t *testing.T) {
 	}
 }
 
+// Inline-construct patterns for TestEmbeddedAssetsHaveNoInlineScriptOrStyle.
+// Go's regexp (RE2) has no lookahead, so the script check finds whole tags and
+// then requires a src attribute.
+var (
+	assetStyleTagRe  = regexp.MustCompile(`(?i)<style\b`)
+	assetScriptTagRe = regexp.MustCompile(`(?is)<script\b[^>]*>`)
+	assetInlineRe    = regexp.MustCompile(`(?i)\son[a-z]+\s*=`)
+)
+
 // TestEmbeddedAssetsHaveNoInlineScriptOrStyle keeps the strict UI
 // Content-Security-Policy (no 'unsafe-inline') valid: the shell must load its
-// script and style from external files only.
+// script and style from external files only. It rejects a <style> element, any
+// <script> tag without a src attribute (which covers a bare <script> and
+// <script type=...>), a javascript: URL, a literal style= attribute, and any
+// inline event handler attribute (onclick=, onsubmit=, onchange=, ...).
 func TestEmbeddedAssetsHaveNoInlineScriptOrStyle(t *testing.T) {
-	forbidden := []string{"<script>", "onclick=", "onload=", "onerror=", "javascript:", ` style="`}
 	err := fs.WalkDir(assetsFS, "assets", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
@@ -402,10 +414,22 @@ func TestEmbeddedAssetsHaveNoInlineScriptOrStyle(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, needle := range forbidden {
-			if bytes.Contains(data, []byte(needle)) {
-				t.Errorf("%s contains forbidden inline construct %q", path, needle)
+		if assetStyleTagRe.Match(data) {
+			t.Errorf("%s contains an inline <style> element", path)
+		}
+		for _, tag := range assetScriptTagRe.FindAll(data, -1) {
+			if !bytes.Contains(bytes.ToLower(tag), []byte("src=")) {
+				t.Errorf("%s contains an inline <script> without a src attribute: %s", path, tag)
 			}
+		}
+		if bytes.Contains(bytes.ToLower(data), []byte("javascript:")) {
+			t.Errorf("%s contains a javascript: URL", path)
+		}
+		if bytes.Contains(bytes.ToLower(data), []byte(` style="`)) {
+			t.Errorf("%s contains a literal style attribute", path)
+		}
+		if loc := assetInlineRe.FindIndex(data); loc != nil {
+			t.Errorf("%s contains an inline event handler %q", path, data[loc[0]:loc[1]])
 		}
 		return nil
 	})

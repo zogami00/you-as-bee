@@ -47,9 +47,11 @@ When `web_ui` is `true` (default `false`, see
 | GET | `/ui/` | The application shell. Redirects to `/ui/login` without a session. Any deeper `/ui/<path>` also serves the shell (a deliberate SPA fallthrough); the more specific `/ui/assets/` pattern still serves real files. |
 | GET | `/ui/assets/{file}` | Embedded CSS and JavaScript. |
 
-Every `/ui/` response carries `Content-Security-Policy` (no `unsafe-inline`),
-`X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY`, because the shell
-exposes the destructive Export/Force/Reset controls.
+Every `/ui/` response, including the `403` for a non-allowlisted peer and other
+error responses, carries `Content-Security-Policy` (no `unsafe-inline`),
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: no-referrer`, because the shell exposes the destructive
+Export/Force/Reset controls.
 
 The session cookie is `HttpOnly; SameSite=Strict`, holds an opaque 64-hex-char
 id, and lives only in the agent's memory, so restarting `yabd` logs every

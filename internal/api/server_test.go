@@ -351,11 +351,25 @@ func TestEveryRegisteredRouteIsPublicOrAllowlisted(t *testing.T) {
 // TestFrontDoorGuardsDirectlyRegisteredRoute proves the front door, not each
 // handler, is what enforces the guard: a route registered directly on the mux
 // (as BLOCKER 1's /ui/ routes were) is still allowlist- and credential-checked.
+// The registration also goes through routeMux, so it is enumerated in
+// allRoutes: TestEveryRegisteredRouteIsPublicOrAllowlisted can no longer miss a
+// route that bypasses the registration table.
 func TestFrontDoorGuardsDirectlyRegisteredRoute(t *testing.T) {
 	srv, _ := newTestServer(t)
 	srv.mux.HandleFunc("GET /v1/directly-registered", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+
+	enumerated := false
+	for _, route := range srv.allRoutes {
+		if route == "GET /v1/directly-registered" {
+			enumerated = true
+			break
+		}
+	}
+	if !enumerated {
+		t.Fatalf("a directly registered route was not enumerated in allRoutes: %v", srv.allRoutes)
+	}
 
 	if rec := request(t, srv, http.MethodGet, "/v1/directly-registered", "203.0.113.9:1234", "", nil); rec.Code != http.StatusForbidden {
 		t.Fatalf("disallowed peer = %d, want 403", rec.Code)
@@ -489,6 +503,31 @@ func TestBackendErrorHidesDetail(t *testing.T) {
 	}
 	if strings.Contains(e.Message, "/sys/") {
 		t.Errorf("error message leaked a path: %q", e.Message)
+	}
+}
+
+// TestRedactPathsOnlyMatchesPathLikeTokens: the redaction regex is anchored to
+// a leading slash at a word boundary, so it redacts paths wherever they appear
+// but leaves an ordinary slash used as a conjunction or in a ratio alone.
+func TestRedactPathsOnlyMatchesPathLikeTokens(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/sys/bus/usb/devices/1-1.2", "[redacted]"},
+		{"write /sys/bus/usb/drivers/usbip-host/bind: permission denied", "write [redacted] permission denied"},
+		{`open "/sys/x" failed`, `open "[redacted]" failed`},
+		{"path=/sys/x", "path=[redacted]"},
+		{"(/sys/x)", "([redacted])"},
+		{"and/or", "and/or"},
+		{"24/7 uptime", "24/7 uptime"},
+		{"read/write mix", "read/write mix"},
+		{"no slash here", "no slash here"},
+	}
+	for _, tc := range cases {
+		if got := redactPaths(tc.in); got != tc.want {
+			t.Errorf("redactPaths(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

@@ -43,8 +43,9 @@ are rate-limited per peer address, so one client cannot hold the login route at
 codes (the token in the form is the credential); the bounded code type is
 retained for the Windows client's flow.
 
-Every `/ui/` response sets `Content-Security-Policy` (`default-src 'none'`,
-script and style only from `'self'`, no `unsafe-inline`), `X-Content-Type-Options:
+Every `/ui/` response, including the `403` for a non-allowlisted peer and other
+error responses, sets `Content-Security-Policy` (`default-src 'none'`, script
+and style only from `'self'`, no `unsafe-inline`), `X-Content-Type-Options:
 nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. This
 matters because the shell carries the destructive Export/Force/Reset controls.
 
