@@ -46,9 +46,9 @@ Rules:
 
 ## Flash the operating system
 
-Use Raspberry Pi OS **Bookworm** (the installer enforces this), enable SSH, set
-a hostname and a user, and boot. The agent needs root for sysfs writes, so
-`provision.sh` is run with `sudo`.
+Use Raspberry Pi OS **Bookworm** (the installer expects a Debian bookworm-era
+release and warns otherwise), enable SSH, set a hostname and a user, and boot.
+The agent needs root for sysfs writes, so `provision.sh` is run with `sudo`.
 
 ## Provision
 

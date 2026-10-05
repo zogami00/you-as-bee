@@ -12,7 +12,7 @@ Legend: `PI$` is a shell on the Pi, `PC>` is an elevated PowerShell on Windows.
 ```bash
 PI$ systemctl is-active yabd          # active
 PI$ systemctl show -p SubState yabd   # running
-PI$ systemctl show -p StatusText yabd  # SERVING on 0.0.0.0:3241
+PI$ systemctl show -p StatusText yabd  # serving on 0.0.0.0:3241
 PI$ yabd doctor                        # all checks passed
 ```
 

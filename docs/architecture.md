@@ -171,8 +171,8 @@ Per pin, on bind/reset failure:
   10 minutes;
 - a device that stays exported for 2 minutes clears its failure history.
 
-Quarantine is cleared by the timer, by an explicit `reset`, or by a
-`yabd reset <pin>`. Only the reconcile loop acts, so the backoff clock is
+Quarantine is cleared by the quarantine timer or by an explicit reset
+(`yabd reset <pin>`). Only the reconcile loop acts, so the backoff clock is
 deterministic and testable.
 
 ## The wire protocol
