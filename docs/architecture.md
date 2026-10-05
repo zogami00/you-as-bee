@@ -136,18 +136,27 @@ If any step fails after the power write, rollback unbinds, removes the
 
 `Unbind` is idempotent per step. It only skips work when the device is gone;
 otherwise it unbinds `usbip-host` when it is the current driver, always drops
-the `match_busid` entry (tolerating `EINVAL` for an unknown busid), always
-re-probes, and restores `power/control`. This matters when an earlier `Unbind`
-failed between writes: the device is off `usbip-host` and has no driver, so a
-retry must complete the remaining steps instead of treating it as a no-op.
+the `match_busid` entry (tolerating `ENODEV` for a busid that was never added,
+and `EINVAL` defensively), always re-probes, and restores `power/control`. This
+matters when an earlier `Unbind` failed between writes: the device is off
+`usbip-host` and has no driver, so a retry must complete the remaining steps
+instead of treating it as a no-op.
+
+The generic USB device driver `us` is not treated as a wrong driver. On a real
+Pi the device-level `driver` symlink is `us` for every un-exported device (the
+function driver such as `btusb` binds to the interfaces), so recovery is only
+triggered by `usbip_status == 3` or by a non-generic driver that is not
+`usbip-host`.
 
 Every sysfs write is performed by the reconcile goroutine. `ReconcileOnce`
-holds the state mutex only to plan a pass and to commit its outcome; the Binder
-calls (and any `modprobe`) run with the lock released, so API status calls stay
+serializes whole passes (so two concurrent callers cannot double-bind) and holds
+the state mutex only to plan a pass and to commit its outcome; the Binder calls
+(and any `modprobe`) run with the lock released, so API status calls stay
 responsive while a bind is in flight.
 
-A forced export is one-shot: the `force` flag is consumed by the pass that acts
-on it and then cleared, so a later attach is refused again unless forced.
+A forced export is consumed only by the pass that actually used it (a pass that
+acts on the pin with `force` set), so a later attach is refused again unless
+forced again.
 
 ## Backoff and quarantine
 

@@ -247,6 +247,16 @@ func TestClientValidationErrors(t *testing.T) {
 			wantSub: "duplicate server name",
 		},
 		{
+			name:    "server name with slash",
+			body:    `{"schema_version":1,"servers":[{"name":"a/b","host":"pi.local","token":"` + validToken + `"}]}`,
+			wantSub: "servers[0].name",
+		},
+		{
+			name:    "server name uppercase",
+			body:    `{"schema_version":1,"servers":[{"name":"Pi","host":"pi.local","token":"` + validToken + `"}]}`,
+			wantSub: "servers[0].name",
+		},
+		{
 			name:    "bad api port",
 			body:    `{"schema_version":1,"servers":[{"name":"pi","host":"a.local","token":"` + validToken + `","api_port":70000}]}`,
 			wantSub: "api_port",

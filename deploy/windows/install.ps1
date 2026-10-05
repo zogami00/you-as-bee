@@ -304,7 +304,9 @@ if ($register) {
     } else {
         Write-Info ("would register '{0}' as: {1} tray" -f $taskName, $targetExe)
     }
-    Write-Ok ("registered task '{0}'" -f $taskName)
+    if (-not $DryRun) {
+        Write-Ok ("registered task '{0}'" -f $taskName)
+    }
 }
 
 Write-Host ''

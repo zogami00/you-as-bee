@@ -171,16 +171,24 @@ func cmdExport(args []string, stdout, stderr io.Writer) int {
 const exportConfirmTimeout = 30 * time.Second
 
 // waitForExported polls the agent until the device is exported (or in use by a
-// client), returning an error on a real absence, a backend error or timeout.
+// client), returning an error on a real absence, a backend error, an error
+// state, or timeout. On timeout the error names the pin and the last state it
+// was seen in, rather than only "context deadline exceeded".
 func waitForExported(ctx context.Context, client *api.Client, id string) (proto.Device, error) {
+	var last proto.Device
+	seen := false
 	for {
 		dev, err := client.Device(ctx, id)
 		if err == nil {
+			last = dev
+			seen = true
 			switch dev.State {
 			case proto.StateExported, proto.StateInUse:
 				return dev, nil
 			case proto.StateAbsent:
 				return dev, fmt.Errorf("%s is not present on the agent", id)
+			case proto.StateError:
+				return dev, fmt.Errorf("%s reported the error state (quarantined or repeatedly failing); run \"yabd reset %s\" and retry", id, id)
 			}
 		} else if !api.IsNotFound(err) {
 			return proto.Device{}, err
@@ -188,7 +196,12 @@ func waitForExported(ctx context.Context, client *api.Client, id string) (proto.
 
 		select {
 		case <-ctx.Done():
-			return proto.Device{}, fmt.Errorf("timed out waiting for %s to reach the exported state", id)
+			if seen {
+				return proto.Device{}, fmt.Errorf("timed out after %s waiting for %s to reach the exported state (last seen: %s)",
+					exportConfirmTimeout, id, last.State)
+			}
+			return proto.Device{}, fmt.Errorf("timed out after %s waiting for %s to reach the exported state (no device state received)",
+				exportConfirmTimeout, id)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -461,6 +474,12 @@ func saveConfig(path string, cfg *config.AgentConfig) error {
 		return err
 	}
 	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	// Flush to stable storage before the rename: a Pi that loses power between
+	// rename and write-back would otherwise find a truncated config on reboot.
+	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err
 	}

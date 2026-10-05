@@ -583,8 +583,8 @@ func twoServerConfig(t *testing.T, ts *httptest.Server, pairs ...config.AutoAtta
 	return config.ClientConfig{
 		SchemaVersion: 1,
 		Servers: []config.ServerConfig{
-			{Name: "piA", Host: host, APIPort: port, Token: strings.Repeat("a", 64)},
-			{Name: "piB", Host: host, APIPort: port, Token: strings.Repeat("b", 64)},
+			{Name: "pia", Host: host, APIPort: port, Token: strings.Repeat("a", 64)},
+			{Name: "pib", Host: host, APIPort: port, Token: strings.Repeat("b", 64)},
 		},
 		AutoAttach:     pairs,
 		Reconnect:      config.ReconnectConfig{Initial: config.Duration(time.Second), Max: config.Duration(10 * time.Second)},
@@ -597,20 +597,20 @@ func TestHandleEventScopedToServer(t *testing.T) {
 	ts, _ := newFakeAgent()
 	defer ts.Close()
 	cfg := twoServerConfig(t, ts,
-		config.AutoAttach{Server: "piA", Device: "xbox"},
-		config.AutoAttach{Server: "piB", Device: "bluetooth"},
+		config.AutoAttach{Server: "pia", Device: "xbox"},
+		config.AutoAttach{Server: "pib", Device: "bluetooth"},
 	)
 	h := newHarness(t, cfg)
-	psB := h.pinByServer(t, "piB", "bluetooth")
+	psB := h.pinByServer(t, "pib", "bluetooth")
 	psB.state = StateAttached
 
-	h.m.HandleEvent("piA", proto.Event{
+	h.m.HandleEvent("pia", proto.Event{
 		Type:   proto.EventDeviceRemoved,
 		Device: proto.Device{Pin: "bluetooth", BusID: "1-1.4"},
 	})
 
 	if psB.state != StateAttached {
-		t.Fatalf("piB state = %q; a piA event must not mark piB absent", psB.state)
+		t.Fatalf("pib state = %q; a pia event must not mark pib absent", psB.state)
 	}
 }
 
@@ -619,19 +619,19 @@ func TestPauseIsScopedToServer(t *testing.T) {
 	ts, _ := newFakeAgent()
 	defer ts.Close()
 	cfg := twoServerConfig(t, ts,
-		config.AutoAttach{Server: "piA", Device: "bluetooth"},
-		config.AutoAttach{Server: "piB", Device: "bluetooth"},
+		config.AutoAttach{Server: "pia", Device: "bluetooth"},
+		config.AutoAttach{Server: "pib", Device: "bluetooth"},
 	)
 	h := newHarness(t, cfg)
 
-	if err := h.m.Pause(context.Background(), "piB/bluetooth"); err != nil {
-		t.Fatalf("Pause(piB/bluetooth): %v", err)
+	if err := h.m.Pause(context.Background(), "pib/bluetooth"); err != nil {
+		t.Fatalf("Pause(pib/bluetooth): %v", err)
 	}
-	if !h.m.IsPaused("piB/bluetooth") {
-		t.Fatal("piB/bluetooth should be paused")
+	if !h.m.IsPaused("pib/bluetooth") {
+		t.Fatal("pib/bluetooth should be paused")
 	}
-	if h.m.IsPaused("piA/bluetooth") {
-		t.Fatal("piA/bluetooth must not be paused by the piB pause")
+	if h.m.IsPaused("pia/bluetooth") {
+		t.Fatal("pia/bluetooth must not be paused by the pib pause")
 	}
 }
 
@@ -639,12 +639,12 @@ func TestPinsAreServerQualified(t *testing.T) {
 	ts, _ := newFakeAgent()
 	defer ts.Close()
 	cfg := twoServerConfig(t, ts,
-		config.AutoAttach{Server: "piA", Device: "xbox"},
-		config.AutoAttach{Server: "piB", Device: "xbox"},
+		config.AutoAttach{Server: "pia", Device: "xbox"},
+		config.AutoAttach{Server: "pib", Device: "xbox"},
 	)
 	h := newHarness(t, cfg)
 	got := h.m.Pins()
-	want := []string{"piA/xbox", "piB/xbox"}
+	want := []string{"pia/xbox", "pib/xbox"}
 	if len(got) != len(want) {
 		t.Fatalf("Pins() = %v, want %v", got, want)
 	}
@@ -736,5 +736,53 @@ func TestStatusSurfacesAttachError(t *testing.T) {
 	st := h.m.Status()
 	if len(st) != 1 || st[0].LastError == "" {
 		t.Fatalf("Status() = %+v, want a surfaced attach error", st)
+	}
+}
+
+// M7: a successful attach must clear an outstanding backoff, so the pin does
+// not keep reporting "backoff" until a stale wait expires.
+func TestMarkAttachedClearsNextAttempt(t *testing.T) {
+	ts, _ := newFakeAgent(presentDevice("xbox", "1-1.4", config.ModeAlways, proto.StateExported))
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+
+	ps := h.pinState(t, "xbox")
+	h.m.mu.Lock()
+	ps.nextAttempt = h.now.Add(time.Minute)
+	h.m.markAttachedLocked(ps, "1-1.4", 0, h.now)
+	cleared := ps.nextAttempt.IsZero()
+	h.m.mu.Unlock()
+
+	if !cleared {
+		t.Fatalf("nextAttempt = %s after a successful attach, want it cleared", ps.nextAttempt)
+	}
+}
+
+// M8: a failed host lookup must not be cached as an empty result for the whole
+// TTL, or a port printing the resolved IP would not be matched for a minute.
+func TestResolveHostDoesNotCacheFailure(t *testing.T) {
+	ts, _ := newFakeAgent()
+	defer ts.Close()
+	h := newHarness(t, testConfig(t, ts, config.AutoAttach{Server: "pi", Device: "xbox"}))
+
+	calls := 0
+	h.m.opt.ResolveHost = func(context.Context, string) []string {
+		calls++
+		if calls == 1 {
+			return nil
+		}
+		return []string{"10.0.0.5"}
+	}
+
+	ctx := context.Background()
+	if got := h.m.resolveHost(ctx, "pi.local"); len(got) != 0 {
+		t.Fatalf("first resolve = %v, want empty (the lookup failed)", got)
+	}
+	got := h.m.resolveHost(ctx, "pi.local")
+	if len(got) == 0 {
+		t.Fatalf("second resolve = %v, want the address: a failed lookup must not be cached", got)
+	}
+	if calls != 2 {
+		t.Fatalf("resolver calls = %d, want 2 (the failure must not be cached)", calls)
 	}
 }

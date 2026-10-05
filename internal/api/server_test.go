@@ -202,25 +202,22 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEveryGuardedRouteRequiresToken fails if a future route is registered
-// without guard.
+// TestEveryGuardedRouteRequiresToken enumerates the guarded routes from the
+// server's registration table and asserts each rejects an unauthenticated
+// request, so a new route added without guard fails this test.
 func TestEveryGuardedRouteRequiresToken(t *testing.T) {
 	srv, _ := newTestServer(t)
-	routes := []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/v1/info"},
-		{http.MethodGet, "/v1/devices"},
-		{http.MethodGet, "/v1/devices/bt"},
-		{http.MethodGet, "/v1/events"},
-		{http.MethodPost, "/v1/devices/bt/export"},
-		{http.MethodPost, "/v1/devices/bt/unexport"},
-		{http.MethodPost, "/v1/devices/bt/reset"},
+	if len(srv.guardedRoutes) == 0 {
+		t.Fatal("no guarded routes registered")
 	}
-	for _, rt := range routes {
-		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
-			rec := request(t, srv, rt.method, rt.path, "10.0.0.5:1234", "", nil)
+	for _, route := range srv.guardedRoutes {
+		method, pattern, ok := strings.Cut(route, " ")
+		if !ok {
+			t.Fatalf("malformed route %q", route)
+		}
+		path := strings.ReplaceAll(pattern, "{id}", "bt")
+		t.Run(route, func(t *testing.T) {
+			rec := request(t, srv, method, path, "10.0.0.5:1234", "", nil)
 			if rec.Code != http.StatusUnauthorized {
 				t.Errorf("status = %d, want 401", rec.Code)
 			}

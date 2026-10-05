@@ -10,6 +10,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
@@ -35,10 +36,11 @@ const (
 	exportedStable   = 2 * time.Minute
 	maxFailures      = 5
 
-	driverName   = "usbip-host"
-	statusOK     = 1
-	statusInUse  = 2
-	statusFailed = 3
+	driverName    = "usbip-host"
+	genericDriver = "us"
+	statusOK      = 1
+	statusInUse   = 2
+	statusFailed  = 3
 )
 
 // Source enumerates the USB devices currently attached to the host.
@@ -90,7 +92,13 @@ type Reconciler struct {
 	Started  time.Time
 	UsbipdUp func() bool
 
-	mu       sync.Mutex
+	mu sync.Mutex
+	// passMu serializes whole reconciliation passes. Run is the only
+	// production caller, but ReconcileOnce is exported; without this a second
+	// concurrent caller would plan from the same pre-bind state and double-bind.
+	// It enforces the single-sysfs-writer invariant; r.mu only protects the
+	// in-memory records.
+	passMu   sync.Mutex
 	explicit map[string]bool
 	force    map[string]bool
 	rec      map[string]*record
@@ -135,19 +143,19 @@ func (r *Reconciler) rand() float64 {
 
 func (r *Reconciler) logf(format string, args ...any) {
 	if r.Log != nil {
-		r.Log.Debug(format, args...)
+		r.Log.Debug(fmt.Sprintf(format, args...))
 	}
 }
 
 func (r *Reconciler) warnf(format string, args ...any) {
 	if r.Log != nil {
-		r.Log.Warn(format, args...)
+		r.Log.Warn(fmt.Sprintf(format, args...))
 	}
 }
 
 func (r *Reconciler) errorf(format string, args ...any) {
 	if r.Log != nil {
-		r.Log.Error(format, args...)
+		r.Log.Error(fmt.Sprintf(format, args...))
 	}
 }
 
@@ -192,10 +200,15 @@ type plannedAction struct {
 // ReconcileOnce performs a single reconciliation pass. It is idempotent: when
 // nothing changed since the previous pass it performs no bind or unbind calls.
 //
-// The lock is held only to snapshot the desired state and to commit the
-// outcome; the Binder (and therefore sysfs writes and modprobe) runs outside
-// it. The reconcile goroutine remains the only writer to sysfs.
+// Passes are serialized by passMu so two callers can never run the bind
+// sequence concurrently; the reconcile goroutine remains the only writer to
+// sysfs. The state lock (r.mu) is held only to snapshot the desired state and
+// to commit the outcome; the Binder (and therefore sysfs writes and modprobe)
+// runs outside it.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
+	r.passMu.Lock()
+	defer r.passMu.Unlock()
+
 	devs, err := r.Source.Enumerate()
 	if err != nil {
 		return err
@@ -279,9 +292,10 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 	healthy := dev.Driver == driverName && dev.Status == statusOK
 	exported := dev.Driver == driverName && (dev.Status == statusOK || dev.Status == statusInUse)
 
-	// A client is attached: never disturb it. Wait until it detaches (status
-	// returns to 1) before acting again.
-	if dev.Status == statusInUse {
+	// A client is attached: never disturb it unless explicitly forced. Without
+	// force, wait until it detaches (status returns to 1) before acting again.
+	// A forced pass falls through so the Bind sequence can disturb the client.
+	if dev.Status == statusInUse && !r.force[pin.Name] {
 		rec.state = Attached
 		rec.exportedAt = now
 		return plannedAction{}, false
@@ -302,10 +316,15 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 			return plannedAction{}, false
 		}
 		// Recovery: a full unbind/rebind is required when a client error was
-		// reported, when the device sits on the wrong driver, or when a
-		// previously exported device is no longer healthy.
+		// reported, when the device sits on a non-generic wrong driver, or when
+		// a previously exported device is no longer healthy.
+		//
+		// The generic USB device driver "us" is not a wrong driver: on a real
+		// Pi it is the device-level driver for every un-exported device (the
+		// function driver, e.g. btusb, binds to the interfaces), so treating it
+		// as wrong would force a pointless Unbind and break the first export.
 		wasExported := rec.state == Exported
-		wrongDriver := dev.Driver != "" && dev.Driver != driverName
+		wrongDriver := dev.Driver != "" && dev.Driver != driverName && dev.Driver != genericDriver
 		rec.state = Binding
 		return plannedAction{
 			pin:     pin.Name,
@@ -329,6 +348,12 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 // The caller must hold r.mu.
 func (r *Reconciler) commitLocked(p *plannedAction, now time.Time) {
 	rec := r.recordLocked(p.pin)
+	// A force is one-shot: consume it only when this action actually carried it,
+	// not merely because a pass ran, so a force set between plan and commit is
+	// not silently dropped unused.
+	if p.force {
+		delete(r.force, p.pin)
+	}
 	if p.release {
 		if p.err != nil {
 			r.warnf("unbind %s failed: %v", p.dev.BusID, p.err)
@@ -341,8 +366,6 @@ func (r *Reconciler) commitLocked(p *plannedAction, now time.Time) {
 		return
 	}
 
-	// A forced bind is one-shot: it is consumed by the pass that acted on it.
-	delete(r.force, p.pin)
 	if p.err != nil {
 		r.warnf("bind %s failed: %v", p.dev.BusID, p.err)
 		r.failLocked(p.pin, rec, now)

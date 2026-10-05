@@ -69,6 +69,13 @@ func (c *ClientConfig) Validate() error {
 		if strings.TrimSpace(s.Name) == "" {
 			return fmt.Errorf("servers[%d].name: must not be empty", i)
 		}
+		// A server name becomes the left half of every qualified pin id
+		// ("server/device"), so it must not contain "/" (or be empty): a name
+		// such as "a/b" would make "a/b/dev" parse as server "a", device
+		// "b/dev" and never resolve. Constrain it exactly like a device name.
+		if !deviceNameRe.MatchString(s.Name) {
+			return fmt.Errorf("servers[%d].name: %q must match ^[a-z0-9-]{1,32}$", i, s.Name)
+		}
 		if serverNames[s.Name] {
 			return fmt.Errorf("servers[%d].name: duplicate server name %q", i, s.Name)
 		}

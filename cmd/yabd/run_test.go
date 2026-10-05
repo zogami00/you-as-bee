@@ -2,13 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/zogami00/you-as-bee/internal/api"
 	"github.com/zogami00/you-as-bee/internal/config"
+	"github.com/zogami00/you-as-bee/internal/proto"
 )
 
 func TestReadTokenRequires64Hex(t *testing.T) {
@@ -130,5 +136,46 @@ func TestWaitReconciler(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
 		t.Errorf("waitReconciler returned after %s, want it to wait for the timeout", elapsed)
+	}
+}
+
+// staticAgent serves one device on every GET.
+func staticAgent(t *testing.T, dev proto.Device) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(dev)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The timeout error must name the pin and the last state, not just "context
+// deadline exceeded".
+func TestWaitForExportedTimeoutReportsLastState(t *testing.T) {
+	srv := staticAgent(t, proto.Device{Pin: "bt", State: proto.StateUnexported, Present: true})
+	client := api.NewClient(srv.URL, strings.Repeat("a", 64), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := waitForExported(ctx, client, "bt")
+	if err == nil {
+		t.Fatal("expected a timeout error, got nil")
+	}
+	if !strings.Contains(err.Error(), "bt") || !strings.Contains(err.Error(), proto.StateUnexported) {
+		t.Fatalf("error = %q, want it to name the pin and the last seen state", err)
+	}
+}
+
+// An error/quarantine state must be reported at once, not waited out.
+func TestWaitForExportedErrorState(t *testing.T) {
+	srv := staticAgent(t, proto.Device{Pin: "bt", State: proto.StateError, Present: true})
+	client := api.NewClient(srv.URL, strings.Repeat("a", 64), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := waitForExported(ctx, client, "bt")
+	if err == nil || !strings.Contains(err.Error(), "error state") {
+		t.Fatalf("error = %v, want an error-state report", err)
 	}
 }

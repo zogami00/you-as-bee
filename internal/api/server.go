@@ -53,7 +53,12 @@ type Server struct {
 	unknownErr error
 	log        *slog.Logger
 	mux        *http.ServeMux
-	http       *http.Server
+	// guardedRoutes records every route registered with guard, as
+	// "METHOD /pattern". Tests enumerate it so a new guarded route cannot be
+	// added without being covered; every entry in the registration table below
+	// is guarded.
+	guardedRoutes []string
+	http          *http.Server
 }
 
 // New builds a Server from cfg.
@@ -74,13 +79,28 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
-	s.mux.Handle("GET /v1/info", s.guard(http.HandlerFunc(s.handleInfo)))
-	s.mux.Handle("GET /v1/devices", s.guard(http.HandlerFunc(s.handleDevices)))
-	s.mux.Handle("GET /v1/devices/{id}", s.guard(http.HandlerFunc(s.handleDevice)))
-	s.mux.Handle("POST /v1/devices/{id}/export", s.guard(http.HandlerFunc(s.handleExport)))
-	s.mux.Handle("POST /v1/devices/{id}/unexport", s.guard(http.HandlerFunc(s.handleUnexport)))
-	s.mux.Handle("POST /v1/devices/{id}/reset", s.guard(http.HandlerFunc(s.handleReset)))
-	s.mux.Handle("GET /v1/events", s.guard(http.HandlerFunc(s.handleEvents)))
+	// Every guarded route is registered from this table, which is also what
+	// TestEveryGuardedRouteRequiresToken enumerates. Registering here with
+	// s.guard is the only way to add a route under /v1/, so a new route is
+	// guarded and covered by construction.
+	guarded := []struct {
+		method  string
+		pattern string
+		handler http.HandlerFunc
+	}{
+		{http.MethodGet, "/v1/info", s.handleInfo},
+		{http.MethodGet, "/v1/devices", s.handleDevices},
+		{http.MethodGet, "/v1/devices/{id}", s.handleDevice},
+		{http.MethodPost, "/v1/devices/{id}/export", s.handleExport},
+		{http.MethodPost, "/v1/devices/{id}/unexport", s.handleUnexport},
+		{http.MethodPost, "/v1/devices/{id}/reset", s.handleReset},
+		{http.MethodGet, "/v1/events", s.handleEvents},
+	}
+	for _, rt := range guarded {
+		pattern := rt.method + " " + rt.pattern
+		s.mux.Handle(pattern, s.guard(rt.handler))
+		s.guardedRoutes = append(s.guardedRoutes, pattern)
+	}
 
 	addr := cfg.Listen
 	if addr == "" {

@@ -49,6 +49,8 @@ func TestRegisterTaskUsesScheduledTaskSettings(t *testing.T) {
 	for _, want := range []string{
 		"Register-ScheduledTask",
 		"New-ScheduledTaskAction",
+		"New-ScheduledTaskTrigger -AtLogOn",
+		"-Trigger $t",
 		"New-ScheduledTaskSettingsSet",
 		"-ExecutionTimeLimit 0",
 		"-AllowStartIfOnBatteries",

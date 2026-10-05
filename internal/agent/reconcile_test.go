@@ -1,8 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -79,7 +82,9 @@ func (b *fakeBinder) Unbind(_ context.Context, dev sysfs.Device, _ usbiphost.Opt
 	if b.failUnbind {
 		return errors.New("unbind failed")
 	}
-	b.src.setDriver(dev.BusID, "btusb", 0)
+	// A released device falls back to the generic USB device driver; the
+	// function driver (here btusb) binds to the interface, not the device.
+	b.src.setDriver(dev.BusID, "us", 0)
 	return nil
 }
 
@@ -112,8 +117,15 @@ func (c *fakeClock) set(t time.Time) {
 
 // --- helpers ---
 
+// btDevice models a real un-exported Bluetooth dongle: the device-level driver
+// is the generic "us", while the function driver btusb is bound to the
+// interface. Treating "us" as a wrong driver used to force a pointless Unbind
+// and break the first export.
 func btDevice() sysfs.Device {
-	return sysfs.Device{BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "btusb"}
+	return sysfs.Device{
+		BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "us",
+		Interfaces: []sysfs.Iface{{BusID: "1-1.2:1.0", Driver: "btusb"}},
+	}
 }
 
 func testPins() []config.DeviceConfig {
@@ -537,5 +549,138 @@ func TestReconcileRetriesFailedUnbind(t *testing.T) {
 	}
 	if r.State("bt") != Present {
 		t.Errorf("state = %s, want present after the retry", r.State("bt"))
+	}
+}
+
+// TestFirstExportWithGenericDriverDoesNotUnbind: on a real Pi an un-exported
+// device sits on the generic "us" device driver (btusb is bound to the
+// interfaces). The first export must go straight to Bind with no prior Unbind.
+func TestFirstExportWithGenericDriverDoesNotUnbind(t *testing.T) {
+	src := newFakeSource(btDevice()) // Driver "us", Status 0
+	binder := &fakeBinder{src: src}
+	r, _ := newTestReconciler(t, src, binder)
+
+	if err := r.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if binder.unbinds != 0 {
+		t.Errorf("unbinds = %d, want 0: the generic us driver is not a wrong driver", binder.unbinds)
+	}
+	if binder.binds != 1 {
+		t.Errorf("binds = %d, want 1", binder.binds)
+	}
+	if r.State("bt") != Exported {
+		t.Errorf("state = %s, want exported", r.State("bt"))
+	}
+}
+
+// TestForceActsOnAttachedDevice: force=true must produce an action for a
+// status-2 (attached) device, matching what docs/api.md promises.
+func TestForceActsOnAttachedDevice(t *testing.T) {
+	dev := sysfs.Device{BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "usbip-host", Status: 2}
+	src := newFakeSource(dev)
+	binder := &fakeBinder{src: src}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.Export(ctx, "bt", true); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if binder.binds+binder.unbinds == 0 {
+		t.Fatal("force on an attached device must produce a bind/unbind action")
+	}
+}
+
+// TestForceConsumedOnlyWhenUsed: a pending force must survive a pass whose
+// action did not carry it, instead of being silently dropped.
+func TestForceConsumedOnlyWhenUsed(t *testing.T) {
+	r := New(nil, newFakeSource(), &fakeBinder{})
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r.force["bt"] = true
+
+	r.mu.Lock()
+	r.commitLocked(&plannedAction{pin: "bt", dev: sysfs.Device{BusID: "1-1.2", DevNum: 5}}, now)
+	_, still := r.force["bt"]
+	r.mu.Unlock()
+
+	if !still {
+		t.Error("an action that did not carry force must not consume the pending force")
+	}
+}
+
+// TestReconcileLogMessagesAreFormatted guards against passing a printf template
+// plus args straight to slog, which renders the template literally and turns a
+// stray arg into !BADKEY.
+func TestReconcileLogMessagesAreFormatted(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src, failBind: true}
+	r, clock := newTestReconciler(t, src, binder)
+	var buf bytes.Buffer
+	r.Log = slog.New(slog.NewTextHandler(&buf, nil))
+
+	ctx := context.Background()
+	for i := 0; i < maxFailures+1; i++ {
+		if err := r.ReconcileOnce(ctx); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		r.mu.Lock()
+		next := r.rec["bt"].nextAttempt
+		r.mu.Unlock()
+		clock.set(next)
+	}
+
+	out := buf.String()
+	if strings.Contains(out, "!BADKEY") {
+		t.Errorf("log output contains !BADKEY (printf args were treated as key/value pairs):\n%s", out)
+	}
+	if strings.Contains(out, "%!") || strings.Contains(out, "%q") || strings.Contains(out, "%s") {
+		t.Errorf("log output contains an unexpanded format verb:\n%s", out)
+	}
+	if !strings.Contains(out, "failed, retrying in") {
+		t.Errorf("retry message is not fully formatted:\n%s", out)
+	}
+	if !strings.Contains(out, "quarantined for") {
+		t.Errorf("quarantine message is not fully formatted:\n%s", out)
+	}
+}
+
+// TestConcurrentReconcileIsSerialized: a second concurrent pass must not plan
+// from the same pre-bind state and double-bind the device.
+func TestConcurrentReconcileIsSerialized(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{
+		src:         src,
+		bindEntered: make(chan struct{}),
+		bindRelease: make(chan struct{}),
+	}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	first := make(chan error, 1)
+	go func() { first <- r.ReconcileOnce(ctx) }()
+	select {
+	case <-binder.bindEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first bind never started")
+	}
+
+	second := make(chan error, 1)
+	go func() { second <- r.ReconcileOnce(ctx) }()
+	// Give the second pass time to reach passMu before the first completes.
+	time.Sleep(50 * time.Millisecond)
+
+	close(binder.bindRelease)
+	if err := <-first; err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	if binder.binds != 1 {
+		t.Errorf("binds = %d, want 1: concurrent passes double-bound the device", binder.binds)
 	}
 }

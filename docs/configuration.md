@@ -45,7 +45,7 @@ device matches a pin and no `serial`/`port` narrows it, the device is
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
 | `schema_version` | int | `1` | Must be `1`. |
-| `servers[].name` | string | - | Unique, human-facing server id. |
+| `servers[].name` | string | - | Unique, human-facing server id, `^[a-z0-9-]{1,32}$` (it prefixes every qualified pin id, so `/` is not allowed). |
 | `servers[].host` | string | - | DNS name or IP of the agent. Unique. |
 | `servers[].api_port` | int | `3241` | Management API port, 1-65535. |
 | `servers[].token` | string | - | Bearer token, exactly 64 lower-case hex characters. |

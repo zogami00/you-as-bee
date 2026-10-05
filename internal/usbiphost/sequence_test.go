@@ -3,8 +3,9 @@ package usbiphost
 import (
 	"context"
 	"errors"
-	"os"
+	"io/fs"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/zogami00/you-as-bee/internal/sysfs"
@@ -454,13 +455,65 @@ func TestUnbindRetryAfterMidSequenceFailure(t *testing.T) {
 	})
 }
 
-func TestUnbindToleratesMissingMatchBusid(t *testing.T) {
+// TestTolerateMissingErrnos pins the errnos that count as "already done". The
+// kernel's match_busid_store returns ENODEV (not EINVAL) when asked to drop a
+// busid that was never added; os.WriteFile wraps it in a *fs.PathError. EINVAL
+// is tolerated defensively, and a genuinely missing file too.
+func TestTolerateMissingErrnos(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"ENODEV", &fs.PathError{Op: "write", Path: testMatch, Err: syscall.ENODEV}, true},
+		{"EINVAL", &fs.PathError{Op: "write", Path: testMatch, Err: syscall.EINVAL}, true},
+		{"ENOENT", &fs.PathError{Op: "write", Path: testMatch, Err: syscall.ENOENT}, true},
+		{"EACCES", &fs.PathError{Op: "write", Path: testMatch, Err: syscall.EACCES}, false},
+		{"plain error", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tolerateMissing(tc.err); got != tc.want {
+				t.Errorf("tolerateMissing(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUnbindToleratesENODEVFromMatchBusid: a real kernel returns ENODEV when
+// match_busid is asked to drop a busid that was never added. Unbind must treat
+// that as success and still re-probe.
+func TestUnbindToleratesENODEVFromMatchBusid(t *testing.T) {
 	f := newBoundTestFS()
 	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
 	f.files[testDevDir+"/usbip_status"] = "1"
-	f.onWrite = func(name, _ string) error {
-		if name == testMatch {
-			return os.ErrInvalid // EINVAL: busid was never added
+	f.onWrite = func(name, data string) error {
+		if name == testMatch && strings.HasPrefix(data, "del") {
+			return &fs.PathError{Op: "write", Path: name, Err: syscall.ENODEV}
+		}
+		return nil
+	}
+
+	b := newBinder(f)
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("Unbind with ENODEV on match_busid: %v", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testUnbind, testBusID},
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+	})
+}
+
+// TestUnbindToleratesEINVALFromMatchBusid: EINVAL is tolerated defensively.
+func TestUnbindToleratesEINVALFromMatchBusid(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "1"
+	f.onWrite = func(name, data string) error {
+		if name == testMatch && strings.HasPrefix(data, "del") {
+			return &fs.PathError{Op: "write", Path: name, Err: syscall.EINVAL}
 		}
 		return nil
 	}
@@ -468,6 +521,50 @@ func TestUnbindToleratesMissingMatchBusid(t *testing.T) {
 	if err := newBinder(f).Unbind(context.Background(), testDevice(), Options{}); err != nil {
 		t.Fatalf("Unbind with EINVAL on match_busid: %v", err)
 	}
+}
+
+// TestUnbindRetryAfterProbeFailureToleratesENODEV covers the partial-failure
+// retry: the first pass removes usbip-host and the match_busid entry, but
+// drivers_probe fails. On the retry the busid is already gone, so the kernel
+// returns ENODEV for `del`; that must be tolerated so drivers_probe still runs
+// and the driverless device is recovered.
+func TestUnbindRetryAfterProbeFailureToleratesENODEV(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "1"
+	probeFails := true
+	f.onWrite = func(name, _ string) error {
+		switch {
+		case name == testUnbind:
+			delete(f.links, testDrvLn) // device is now driverless
+			f.files[testDevDir+"/usbip_status"] = "0"
+		case name == testProbe && probeFails:
+			return errors.New("write: input/output error")
+		}
+		return nil
+	}
+
+	b := newBinder(f)
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err == nil {
+		t.Fatal("first Unbind: expected the probe failure, got nil")
+	}
+	f.writes = nil
+	probeFails = false
+	// The busid is already gone, so the kernel now rejects `del` with ENODEV.
+	f.onWrite = func(name, _ string) error {
+		if name == testMatch {
+			return &fs.PathError{Op: "write", Path: name, Err: syscall.ENODEV}
+		}
+		return nil
+	}
+
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("retry Unbind: %v", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+	})
 }
 
 func TestPreflightNotRoot(t *testing.T) {

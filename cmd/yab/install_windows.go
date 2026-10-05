@@ -99,15 +99,18 @@ func doInstall(ctx context.Context, r execx.Runner) error {
 
 // registerTask creates the highest-privilege logon task through the
 // ScheduledTasks module rather than `schtasks /TR`, which cannot express the
-// settings below and whose argument quoting fails on PowerShell 5.1. The
-// settings stop Windows from killing the task after 72 hours or refusing to
-// start it on battery, both of which would silently drop the supervisor.
+// settings below and whose argument quoting fails on PowerShell 5.1. The task
+// needs an -AtLogOn trigger: without one it is registered but never fires, so
+// the tray and supervisor would not start at logon. The settings stop Windows
+// from killing the task after 72 hours or refusing to start it on battery, both
+// of which would silently drop the supervisor.
 func registerTask(ctx context.Context, r execx.Runner, exe string) error {
 	script := fmt.Sprintf(
 		"$a = New-ScheduledTaskAction -Execute %s -Argument 'tray'; "+
+			"$t = New-ScheduledTaskTrigger -AtLogOn; "+
 			"$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 "+
 			"-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; "+
-			"Register-ScheduledTask -TaskName %s -Action $a -Settings $s "+
+			"Register-ScheduledTask -TaskName %s -Action $a -Trigger $t -Settings $s "+
 			"-RunLevel Highest -Force | Out-Null",
 		psSingleQuote(exe), psSingleQuote(taskName))
 	if _, se, err := r.Run(ctx, "powershell.exe",

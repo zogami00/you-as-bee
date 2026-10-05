@@ -636,6 +636,9 @@ func (m *Manager) markAttachedLocked(ps *pinState, busid string, port int, now t
 	if now.Sub(ps.attachedSince) >= m.opt.StableAfter {
 		ps.backoff = 0
 	}
+	// A successful attach clears any outstanding retry, so the pin does not
+	// keep reporting "backoff" until a wait that no longer applies expires.
+	ps.nextAttempt = time.Time{}
 	ps.everAttached = true
 	ps.state = StateAttached
 	ps.lastError = ""
@@ -792,9 +795,14 @@ func (m *Manager) resolveHost(ctx context.Context, host string) []string {
 
 	addrs := m.opt.ResolveHost(ctx, host)
 
-	m.mu.Lock()
-	m.hostCache[key] = hostCacheEntry{addrs: addrs, at: m.now()}
-	m.mu.Unlock()
+	// Do not cache an empty result: a transient DNS failure would otherwise be
+	// reused for the whole TTL, so a port printing the resolved IP would not be
+	// matched for up to a minute. A later call retries the lookup immediately.
+	if len(addrs) > 0 {
+		m.mu.Lock()
+		m.hostCache[key] = hostCacheEntry{addrs: addrs, at: m.now()}
+		m.mu.Unlock()
+	}
 	return addrs
 }
 

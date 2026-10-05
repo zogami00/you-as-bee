@@ -17,6 +17,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/zogami00/you-as-bee/internal/execx"
 	"github.com/zogami00/you-as-bee/internal/sysfs"
@@ -185,7 +186,7 @@ func (b *Binder) Unbind(ctx context.Context, dev sysfs.Device, opts Options) err
 			return fmt.Errorf("usbiphost: unbind: %w", err)
 		}
 	}
-	// Step 2: always drop the busid claim. The kernel reports EINVAL when the
+	// Step 2: always drop the busid claim. The kernel reports ENODEV when the
 	// busid was never added, which is not a failure.
 	if err := b.write(b.matchBusid(), "del "+dev.BusID); err != nil && !tolerateMissing(err) {
 		return fmt.Errorf("usbiphost: match_busid del: %w", err)
@@ -204,10 +205,15 @@ func (b *Binder) Unbind(ctx context.Context, dev sysfs.Device, opts Options) err
 }
 
 // tolerateMissing reports whether a write failed because the entry did not
-// exist, which callers treat as already done. sysfs returns EINVAL (mapped to
-// os.ErrInvalid) when match_busid is asked to drop an unknown busid.
+// exist, which callers treat as already done. The kernel's match_busid_store
+// returns ENODEV (wrapped by os.WriteFile in a *fs.PathError) when asked to
+// drop a busid that was never added, so the caller can proceed. EINVAL, which
+// the same attribute returns for a malformed command, is tolerated defensively,
+// as is a genuinely missing file.
 func tolerateMissing(err error) bool {
-	return errors.Is(err, os.ErrInvalid) || errors.Is(err, os.ErrNotExist)
+	return errors.Is(err, syscall.ENODEV) ||
+		errors.Is(err, syscall.EINVAL) ||
+		errors.Is(err, os.ErrNotExist)
 }
 
 // preflight requires root and the usbip-host driver, loading the modules when
