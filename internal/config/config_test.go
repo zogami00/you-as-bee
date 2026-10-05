@@ -42,9 +42,6 @@ func TestAgentDefaults(t *testing.T) {
 	if cfg.USBIP.Bin != "/usr/sbin/usbip" || cfg.USBIP.UsbipdBin != "/usr/sbin/usbipd" {
 		t.Errorf("USBIP defaults = %+v", cfg.USBIP)
 	}
-	if !cfg.USBIP.ManageUsbipd {
-		t.Errorf("USBIP.ManageUsbipd = false, want true")
-	}
 	if cfg.LogLevel != "info" || cfg.LogFormat != "text" {
 		t.Errorf("log defaults = %q/%q", cfg.LogLevel, cfg.LogFormat)
 	}
@@ -194,13 +191,14 @@ func TestAgentDeviceModeDefault(t *testing.T) {
 	}
 }
 
-func TestManageUsbipdExplicitFalseWins(t *testing.T) {
+func TestRemovedManageUsbipdIsRejected(t *testing.T) {
 	var cfg AgentConfig
-	if err := Load(writeTemp(t, `{"schema_version":1,"usbip":{"manage_usbipd":false}}`), &cfg); err != nil {
-		t.Fatalf("Load: %v", err)
+	err := Load(writeTemp(t, `{"schema_version":1,"usbip":{"manage_usbipd":false}}`), &cfg)
+	if err == nil {
+		t.Fatal("expected the removed manage_usbipd field to be rejected")
 	}
-	if cfg.USBIP.ManageUsbipd {
-		t.Error("ManageUsbipd = true, want explicit false to win over the default")
+	if !strings.Contains(err.Error(), "manage_usbipd") {
+		t.Errorf("error %q does not name the removed field", err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path"
 	"strconv"
 	"strings"
@@ -40,11 +41,10 @@ var (
 )
 
 const (
-	driverName       = "usbip-host"
-	statusUnexported = 0
-	statusExported   = 1
-	statusAttached   = 2
-	statusError      = 3
+	driverName     = "usbip-host"
+	statusExported = 1
+	statusAttached = 2
+	statusError    = 3
 )
 
 // SysFS is the injectable filesystem used by the bind sequence. Every read and
@@ -70,8 +70,8 @@ func Bind(ctx context.Context, dev sysfs.Device, opts Options) error {
 }
 
 // Unbind releases dev using a default Binder constructed by New.
-func Unbind(ctx context.Context, dev sysfs.Device) error {
-	return New().Unbind(ctx, dev)
+func Unbind(ctx context.Context, dev sysfs.Device, opts Options) error {
+	return New().Unbind(ctx, dev, opts)
 }
 
 // Binder performs the usbip-host bind/unbind sequence against a sysfs tree.
@@ -157,8 +157,13 @@ func (b *Binder) Bind(ctx context.Context, dev sysfs.Device, opts Options) error
 }
 
 // Unbind releases dev from usbip-host and lets the original driver claim it
-// again. It is a no-op when the device is gone or was not exported.
-func (b *Binder) Unbind(ctx context.Context, dev sysfs.Device) error {
+// again. It is a no-op only when the device is gone.
+//
+// The steps are idempotent: even when the device is no longer on usbip-host
+// (for example after a previous Unbind failed between two writes), the
+// match_busid claim is always dropped and drivers_probe is always run so a
+// device that was left driverless is recovered, and power/control is restored.
+func (b *Binder) Unbind(ctx context.Context, dev sysfs.Device, opts Options) error {
 	if b.Unsupported || b.FS == nil {
 		return ErrUnsupported
 	}
@@ -169,19 +174,40 @@ func (b *Binder) Unbind(ctx context.Context, dev sysfs.Device) error {
 	if err != nil {
 		return nil
 	}
-	if cur.Driver != driverName && cur.Status == statusUnexported {
-		return nil
+	// Same guard as Bind: do not disturb an attached client unless forced.
+	if cur.Status == statusAttached && !opts.Force {
+		return ErrInUse
 	}
-	if err := b.write(b.usbipHostUnbind(), dev.BusID); err != nil {
-		return fmt.Errorf("usbiphost: unbind: %w", err)
+
+	// Step 1: release usbip-host when it is the current driver.
+	if cur.Driver == driverName {
+		if err := b.write(b.usbipHostUnbind(), dev.BusID); err != nil {
+			return fmt.Errorf("usbiphost: unbind: %w", err)
+		}
 	}
-	if err := b.write(b.matchBusid(), "del "+dev.BusID); err != nil {
+	// Step 2: always drop the busid claim. The kernel reports EINVAL when the
+	// busid was never added, which is not a failure.
+	if err := b.write(b.matchBusid(), "del "+dev.BusID); err != nil && !tolerateMissing(err) {
 		return fmt.Errorf("usbiphost: match_busid del: %w", err)
 	}
+	// Step 3: always re-probe so a driverless device gets a driver back.
 	if err := b.write(b.driversProbe(), dev.BusID); err != nil {
 		return fmt.Errorf("usbiphost: drivers_probe: %w", err)
 	}
+	// Step 4: restore autosuspend unless it is already at the kernel default.
+	if cur.PowerControl != "" && cur.PowerControl != "auto" {
+		if err := b.write(b.powerControl(dev.BusID), "auto"); err != nil {
+			return fmt.Errorf("usbiphost: restore power/control: %w", err)
+		}
+	}
 	return nil
+}
+
+// tolerateMissing reports whether a write failed because the entry did not
+// exist, which callers treat as already done. sysfs returns EINVAL (mapped to
+// os.ErrInvalid) when match_busid is asked to drop an unknown busid.
+func tolerateMissing(err error) bool {
+	return errors.Is(err, os.ErrInvalid) || errors.Is(err, os.ErrNotExist)
 }
 
 // preflight requires root and the usbip-host driver, loading the modules when
@@ -228,20 +254,20 @@ func (b *Binder) verify(busid string, generation int) error {
 // rollback undoes a partially completed bind, best-effort, and wraps cause so
 // that both ErrRolledBack and the original error remain matchable.
 func (b *Binder) rollback(busid, savedPower string, cause error) error {
-	b.logf("rollback for %s: %v", busid, cause)
+	b.warnf("bind failed for %s, rolling back: %v", busid, cause)
 
 	if err := b.write(b.usbipHostUnbind(), busid); err != nil {
-		b.logf("rollback: usbip-host unbind: %v", err)
+		b.warnf("rollback: usbip-host unbind for %s: %v", busid, err)
 	}
-	if err := b.write(b.matchBusid(), "del "+busid); err != nil {
-		b.logf("rollback: match_busid del: %v", err)
+	if err := b.write(b.matchBusid(), "del "+busid); err != nil && !tolerateMissing(err) {
+		b.warnf("rollback: match_busid del for %s: %v", busid, err)
 	}
 	if err := b.write(b.driversProbe(), busid); err != nil {
-		b.logf("rollback: drivers_probe: %v", err)
+		b.warnf("rollback: drivers_probe for %s: %v", busid, err)
 	}
 	if savedPower != "" {
 		if err := b.write(b.powerControl(busid), savedPower); err != nil {
-			b.logf("rollback: restore power/control: %v", err)
+			b.warnf("rollback: restore power/control for %s: %v", busid, err)
 		}
 	}
 	return fmt.Errorf("%w: %w", ErrRolledBack, cause)
@@ -347,6 +373,12 @@ func (b *Binder) driversProbe() string {
 func (b *Binder) logf(format string, args ...any) {
 	if b.Log != nil {
 		b.Log.Debug(fmt.Sprintf(format, args...))
+	}
+}
+
+func (b *Binder) warnf(format string, args ...any) {
+	if b.Log != nil {
+		b.Log.Warn(fmt.Sprintf(format, args...))
 	}
 }
 

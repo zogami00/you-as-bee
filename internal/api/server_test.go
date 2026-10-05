@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,9 +14,10 @@ import (
 )
 
 type fakeBackend struct {
-	devices  []proto.Device
-	exported []string
-	forced   []bool
+	devices   []proto.Device
+	exported  []string
+	forced    []bool
+	exportErr error
 }
 
 func (f *fakeBackend) Info(context.Context) proto.Info { return proto.Info{Version: "test"} }
@@ -31,6 +34,9 @@ func (f *fakeBackend) Device(_ context.Context, id string) (proto.Device, bool) 
 }
 
 func (f *fakeBackend) Export(_ context.Context, id string, force bool) error {
+	if f.exportErr != nil {
+		return f.exportErr
+	}
 	f.exported = append(f.exported, id)
 	f.forced = append(f.forced, force)
 	return nil
@@ -154,8 +160,8 @@ func TestUnknownDeviceNotFound(t *testing.T) {
 func TestExportForcePassedThrough(t *testing.T) {
 	srv, backend := newTestServer(t)
 	rec := request(t, srv, http.MethodPost, "/v1/devices/bt/export?force=true", "10.0.0.5:1234", testToken, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
 	}
 	if len(backend.exported) != 1 || backend.exported[0] != "bt" {
 		t.Fatalf("exported = %v", backend.exported)
@@ -193,6 +199,127 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if _, err := client.Device(ctx, "ghost"); !IsNotFound(err) {
 		t.Errorf("Device(ghost) error = %v, want not found", err)
+	}
+}
+
+// TestEveryGuardedRouteRequiresToken fails if a future route is registered
+// without guard.
+func TestEveryGuardedRouteRequiresToken(t *testing.T) {
+	srv, _ := newTestServer(t)
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v1/info"},
+		{http.MethodGet, "/v1/devices"},
+		{http.MethodGet, "/v1/devices/bt"},
+		{http.MethodGet, "/v1/events"},
+		{http.MethodPost, "/v1/devices/bt/export"},
+		{http.MethodPost, "/v1/devices/bt/unexport"},
+		{http.MethodPost, "/v1/devices/bt/reset"},
+	}
+	for _, rt := range routes {
+		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
+			rec := request(t, srv, rt.method, rt.path, "10.0.0.5:1234", "", nil)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+func TestMalformedAuthorizationHeadersUnauthorized(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cases := map[string]string{
+		"bearer no space": "Bearer" + testToken,
+		"basic":           "Basic " + testToken,
+		"lowercase":       "bearer " + testToken,
+		"empty header":    "",
+	}
+	for name, header := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := request(t, srv, http.MethodGet, "/v1/devices", "10.0.0.5:1234", "", map[string]string{"Authorization": header})
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+func TestEmptyConfiguredTokenRejectsEveryone(t *testing.T) {
+	backend := &fakeBackend{}
+	srv, err := New(Config{
+		Token:          "",
+		AllowedClients: []string{"10.0.0.0/8"},
+		Backend:        backend,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := request(t, srv, http.MethodGet, "/v1/devices", "10.0.0.5:1234", "", nil)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status with empty configured token = %d, want 401", rec.Code)
+	}
+}
+
+func TestUnparseableRemoteAddrForbidden(t *testing.T) {
+	srv, _ := newTestServer(t)
+	for _, addr := range []string{"", "not-an-ip", "not-an-ip:1234"} {
+		rec := request(t, srv, http.MethodGet, "/v1/devices", addr, testToken, nil)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("RemoteAddr %q: status = %d, want 403", addr, rec.Code)
+		}
+	}
+}
+
+// TestAllowlistCheckedBeforeToken: a disallowed peer is refused with 403 even
+// when no token is presented.
+func TestAllowlistCheckedBeforeToken(t *testing.T) {
+	srv, _ := newTestServer(t)
+	rec := request(t, srv, http.MethodGet, "/v1/devices", "203.0.113.5:1234", "", nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 before 401", rec.Code)
+	}
+}
+
+func TestExportUnknownDeviceMapsToNotFound(t *testing.T) {
+	sentinel := errors.New("agent: unknown device")
+	backend := &fakeBackend{exportErr: sentinel}
+	srv, err := New(Config{
+		Token:          testToken,
+		AllowedClients: []string{"10.0.0.0/8"},
+		Backend:        backend,
+		UnknownErr:     sentinel,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := request(t, srv, http.MethodPost, "/v1/devices/ghost/export", "10.0.0.5:1234", testToken, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestBackendErrorHidesDetail(t *testing.T) {
+	backend := &fakeBackend{exportErr: errors.New("open /sys/bus/usb/devices/1-1.2/idVendor: permission denied")}
+	srv, err := New(Config{
+		Token:          testToken,
+		AllowedClients: []string{"10.0.0.0/8"},
+		Backend:        backend,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := request(t, srv, http.MethodPost, "/v1/devices/bt/export", "10.0.0.5:1234", testToken, nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	var e proto.Error
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if strings.Contains(e.Message, "/sys/") {
+		t.Errorf("error message leaked a path: %q", e.Message)
 	}
 }
 

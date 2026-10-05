@@ -14,15 +14,21 @@ type FakeFS struct {
 	mu    sync.RWMutex
 	files map[string]string
 	links map[string]string
-	dirs  map[string]bool
+	// linkDirs marks symlinks that resolve to a directory, mirroring the real
+	// sysfs where each /sys/bus/usb/devices entry is a directory symlink. Only
+	// these links are followed as path components; a plain AddLink (such as a
+	// driver link) is never resolved.
+	linkDirs map[string]bool
+	dirs     map[string]bool
 }
 
 // NewFakeFS returns an empty FakeFS.
 func NewFakeFS() *FakeFS {
 	return &FakeFS{
-		files: make(map[string]string),
-		links: make(map[string]string),
-		dirs:  make(map[string]bool),
+		files:    make(map[string]string),
+		links:    make(map[string]string),
+		linkDirs: make(map[string]bool),
+		dirs:     make(map[string]bool),
 	}
 }
 
@@ -51,11 +57,24 @@ func (f *FakeFS) AddDir(name string) *FakeFS {
 	return f
 }
 
+// AddLinkDir records name as a symbolic link that resolves to a directory,
+// exactly as every entry under /sys/bus/usb/devices does on a real system.
+// Paths below name are looked up through the link; AddLink alone is not
+// resolved.
+func (f *FakeFS) AddLinkDir(name, target string) *FakeFS {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := clean(name)
+	f.links[key] = target
+	f.linkDirs[key] = true
+	return f
+}
+
 // ReadFile implements FS.
 func (f *FakeFS) ReadFile(name string) ([]byte, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	name = clean(name)
+	name = f.resolveLocked(clean(name))
 	if content, ok := f.files[name]; ok {
 		return []byte(content), nil
 	}
@@ -66,7 +85,7 @@ func (f *FakeFS) ReadFile(name string) ([]byte, error) {
 func (f *FakeFS) ReadDir(name string) ([]DirEntry, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	name = clean(name)
+	name = f.resolveLocked(clean(name))
 	if !f.dirExistsLocked(name) {
 		return nil, fmt.Errorf("sysfs: readdir %s: no such directory", name)
 	}
@@ -77,7 +96,7 @@ func (f *FakeFS) ReadDir(name string) ([]DirEntry, error) {
 			return
 		}
 		seen[child] = true
-		out = append(out, DirEntry{Name: child, Dir: f.dirExistsLocked(path.Join(name, child))})
+		out = append(out, DirEntry{Name: child, Dir: f.isDirLocked(path.Join(name, child))})
 	}
 	prefix := name + "/"
 	if name == "/" {
@@ -112,7 +131,9 @@ func firstSegment(rest string) string {
 func (f *FakeFS) ReadLink(name string) (string, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	name = clean(name)
+	// Resolve only intermediate directory links; the link being read is
+	// returned with its raw target, as linkBase expects.
+	name = f.resolveLocked(clean(name))
 	if target, ok := f.links[name]; ok {
 		return target, nil
 	}
@@ -123,8 +144,8 @@ func (f *FakeFS) ReadLink(name string) (string, error) {
 func (f *FakeFS) Stat(name string) (FileInfo, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	name = clean(name)
-	if f.dirExistsLocked(name) {
+	name = f.resolveLocked(clean(name))
+	if f.isDirLocked(name) {
 		return FileInfo{Dir: true, Exists: true}, nil
 	}
 	if _, ok := f.files[name]; ok {
@@ -134,6 +155,40 @@ func (f *FakeFS) Stat(name string) (FileInfo, error) {
 		return FileInfo{Exists: true}, nil
 	}
 	return FileInfo{}, fmt.Errorf("sysfs: stat %s: no such file", name)
+}
+
+// resolveLocked rewrites name through any symlinked-directory components. Only
+// links recorded by AddLinkDir are followed; the caller must hold at least the
+// read lock.
+func (f *FakeFS) resolveLocked(name string) string {
+	for i := 0; i < 16; i++ {
+		link := ""
+		for l := range f.linkDirs {
+			if name == l || strings.HasPrefix(name, l+"/") {
+				if len(l) > len(link) {
+					link = l
+				}
+			}
+		}
+		if link == "" {
+			return name
+		}
+		target := f.links[link]
+		if !path.IsAbs(target) {
+			target = path.Join(path.Dir(link), target)
+		}
+		name = clean(target + strings.TrimPrefix(name, link))
+	}
+	return name
+}
+
+// isDirLocked reports whether name resolves to a directory. The caller must
+// hold at least the read lock.
+func (f *FakeFS) isDirLocked(name string) bool {
+	if f.linkDirs[name] {
+		return true
+	}
+	return f.dirExistsLocked(f.resolveLocked(name))
 }
 
 // dirExistsLocked reports whether name is a directory (explicit or implied by a

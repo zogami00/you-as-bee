@@ -5,7 +5,10 @@
 // itself, and symlinks inside it, are Linux-only.
 package sysfs
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+)
 
 // FS abstracts the filesystem operations used to describe sysfs. The real
 // implementation is OSFS; tests use the in-memory FakeFS in fake.go.
@@ -39,6 +42,12 @@ type OSFS struct{}
 func (OSFS) ReadFile(name string) ([]byte, error) { return os.ReadFile(name) }
 
 // ReadDir implements FS.
+//
+// Every entry under /sys/bus/usb/devices is a symlink to the real device
+// directory, and os.DirEntry.IsDir reports false for a symlink. An entry is
+// therefore only a directory when it is one itself or when it is a symlink
+// that resolves to a directory. A broken symlink degrades to a non-directory
+// rather than failing the whole listing.
 func (OSFS) ReadDir(name string) ([]DirEntry, error) {
 	ents, err := os.ReadDir(name)
 	if err != nil {
@@ -46,7 +55,12 @@ func (OSFS) ReadDir(name string) ([]DirEntry, error) {
 	}
 	out := make([]DirEntry, 0, len(ents))
 	for _, e := range ents {
-		out = append(out, DirEntry{Name: e.Name(), Dir: e.IsDir()})
+		dir := e.IsDir()
+		if e.Type()&os.ModeSymlink != 0 {
+			fi, statErr := os.Stat(filepath.Join(name, e.Name()))
+			dir = statErr == nil && fi.IsDir()
+		}
+		out = append(out, DirEntry{Name: e.Name(), Dir: dir})
 	}
 	return out, nil
 }

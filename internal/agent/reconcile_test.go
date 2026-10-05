@@ -51,10 +51,22 @@ type fakeBinder struct {
 	unbinds    int
 	failBind   bool
 	failUnbind bool
+
+	// bindEntered is closed when a bind starts and bindRelease gates its
+	// completion, so a test can hold a bind in flight.
+	bindEntered chan struct{}
+	bindRelease chan struct{}
+	bindOnce    sync.Once
 }
 
 func (b *fakeBinder) Bind(_ context.Context, dev sysfs.Device, _ usbiphost.Options) error {
 	b.binds++
+	if b.bindEntered != nil {
+		b.bindOnce.Do(func() { close(b.bindEntered) })
+	}
+	if b.bindRelease != nil {
+		<-b.bindRelease
+	}
 	if b.failBind {
 		return errors.New("bind failed")
 	}
@@ -62,7 +74,7 @@ func (b *fakeBinder) Bind(_ context.Context, dev sysfs.Device, _ usbiphost.Optio
 	return nil
 }
 
-func (b *fakeBinder) Unbind(_ context.Context, dev sysfs.Device) error {
+func (b *fakeBinder) Unbind(_ context.Context, dev sysfs.Device, _ usbiphost.Options) error {
 	b.unbinds++
 	if b.failUnbind {
 		return errors.New("unbind failed")
@@ -402,5 +414,128 @@ func TestSubscribeReceivesStateChange(t *testing.T) {
 		}
 	default:
 		t.Fatal("no event received")
+	}
+}
+
+// TestJitterStaysWithinCap checks that the backoff ceiling is applied after
+// jitter (the bug made a 60s cap reach 72s).
+func TestJitterStaysWithinCap(t *testing.T) {
+	r := New(nil, newFakeSource(), &fakeBinder{})
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	r.Rand = func() float64 { return 1 } // maximum upward jitter
+	rec := &record{backoff: maxBackoff}
+	r.mu.Lock()
+	r.failLocked("bt", rec, now)
+	r.mu.Unlock()
+	if got := rec.nextAttempt.Sub(now); got > maxBackoff {
+		t.Errorf("delay with max jitter = %s, want <= %s", got, maxBackoff)
+	}
+
+	r.Rand = func() float64 { return 0 } // maximum downward jitter
+	rec = &record{backoff: maxBackoff}
+	r.mu.Lock()
+	r.failLocked("bt", rec, now)
+	r.mu.Unlock()
+	minDelay := time.Duration(float64(maxBackoff) * (1 - jitterFraction))
+	if got := rec.nextAttempt.Sub(now); got < minDelay {
+		t.Errorf("delay with min jitter = %s, want >= %s", got, minDelay)
+	}
+}
+
+// TestForceIsOneShot verifies that a forced export is consumed by the pass that
+// acts on it instead of persisting until Unexport.
+func TestForceIsOneShot(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.Export(ctx, "bt", true); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	r.mu.Lock()
+	_, still := r.force["bt"]
+	r.mu.Unlock()
+	if still {
+		t.Error("force was not consumed by the pass that acted on it")
+	}
+}
+
+// TestDevicesCompletesWhileBindInFlight is the regression for holding r.mu
+// across Binder.Bind: the API must remain responsive during a bind.
+func TestDevicesCompletesWhileBindInFlight(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{
+		src:         src,
+		bindEntered: make(chan struct{}),
+		bindRelease: make(chan struct{}),
+	}
+	r, _ := newTestReconciler(t, src, binder)
+
+	done := make(chan error, 1)
+	go func() { done <- r.ReconcileOnce(context.Background()) }()
+
+	select {
+	case <-binder.bindEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bind never started")
+	}
+
+	devs := make(chan int, 1)
+	go func() { devs <- len(r.Devices(context.Background())) }()
+	select {
+	case <-devs:
+	case <-time.After(2 * time.Second):
+		close(binder.bindRelease)
+		t.Fatal("Devices blocked while a bind was in flight")
+	}
+
+	close(binder.bindRelease)
+	if err := <-done; err != nil {
+		t.Fatalf("ReconcileOnce: %v", err)
+	}
+}
+
+// TestReconcileRetriesFailedUnbind drives a failed Unbind from the reconciler
+// and checks that a later pass retries it.
+func TestReconcileRetriesFailedUnbind(t *testing.T) {
+	dev := sysfs.Device{BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "usbip-host", Status: 1}
+	src := newFakeSource(dev)
+	binder := &fakeBinder{src: src, failUnbind: true}
+	clock := newFakeClock()
+	pins := []config.DeviceConfig{{Name: "bt", VID: "0a12", PID: "0001", Mode: config.ModeOnDemand}}
+	r := New(pins, src, binder)
+	r.Now = clock.Now
+	r.Rand = func() float64 { return 0.5 }
+
+	ctx := context.Background()
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if r.State("bt") != Backoff {
+		t.Fatalf("state = %s, want backoff after a failed unbind", r.State("bt"))
+	}
+	if binder.unbinds != 1 {
+		t.Fatalf("unbinds = %d, want 1", binder.unbinds)
+	}
+
+	binder.failUnbind = false
+	r.mu.Lock()
+	next := r.rec["bt"].nextAttempt
+	r.mu.Unlock()
+	clock.set(next)
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if binder.unbinds != 2 {
+		t.Errorf("unbinds = %d, want 2 (the failed unbind must be retried)", binder.unbinds)
+	}
+	if r.State("bt") != Present {
+		t.Errorf("state = %s, want present after the retry", r.State("bt"))
 	}
 }

@@ -10,8 +10,7 @@
   "poll_interval": "5s",
   "usbip": {
     "bin": "/usr/sbin/usbip",
-    "usbipd_bin": "/usr/sbin/usbipd",
-    "manage_usbipd": true
+    "usbipd_bin": "/usr/sbin/usbipd"
   },
   "devices": [
     {

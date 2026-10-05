@@ -107,10 +107,6 @@ Reported states (the API's `state` values) are a projection of the above:
 | Exported              | `exported`  |
 | Attached              | `in_use`    |
 | Backoff, Quarantined  | `error`     |
-| Disabled              | `error`     |
-
-`Disabled` is defined in `internal/agent/state.go` but no code path currently
-sets it; it is reserved.
 
 The `always` and `on_demand` modes only affect whether the device is exported
 without an explicit request. An `on_demand` device still stays exported once a
@@ -136,8 +132,22 @@ a later step fails:
    `1`, and the device generation (`devnum`) must not have changed.
 
 If any step fails after the power write, rollback unbinds, removes the
-`match_busid` entry and re-probes the original driver. `Unbind` is a no-op when
-the device is gone or was never exported.
+`match_busid` entry and re-probes the original driver.
+
+`Unbind` is idempotent per step. It only skips work when the device is gone;
+otherwise it unbinds `usbip-host` when it is the current driver, always drops
+the `match_busid` entry (tolerating `EINVAL` for an unknown busid), always
+re-probes, and restores `power/control`. This matters when an earlier `Unbind`
+failed between writes: the device is off `usbip-host` and has no driver, so a
+retry must complete the remaining steps instead of treating it as a no-op.
+
+Every sysfs write is performed by the reconcile goroutine. `ReconcileOnce`
+holds the state mutex only to plan a pass and to commit its outcome; the Binder
+calls (and any `modprobe`) run with the lock released, so API status calls stay
+responsive while a bind is in flight.
+
+A forced export is one-shot: the `force` flag is consumed by the pass that acts
+on it and then cleared, so a later attach is refused again unless forced.
 
 ## Backoff and quarantine
 

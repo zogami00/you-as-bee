@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -77,9 +78,10 @@ func runAgent(configPath, listen, level, format string, output io.Writer) error 
 	}
 
 	hostname, _ := os.Hostname()
-	api.SetUnknownError(agent.ErrUnknown)
 
-	rec := agent.New(cfg.Devices, &sysfsSource{fsys: sysfs.OSFS{}, root: "/sys/bus/usb/devices"}, usbiphost.New())
+	binder := usbiphost.New()
+	binder.Log = logger
+	rec := agent.New(cfg.Devices, &sysfsSource{fsys: sysfs.OSFS{}, root: "/sys/bus/usb/devices"}, binder)
 	rec.Log = logger
 	rec.Version = version.Version
 	rec.Hostname = hostname
@@ -92,6 +94,7 @@ func runAgent(configPath, listen, level, format string, output io.Writer) error 
 		Token:          token,
 		AllowedClients: cfg.AllowedClients,
 		Backend:        rec,
+		UnknownErr:     agent.ErrUnknown,
 		Log:            logger,
 	})
 	if err != nil {
@@ -107,21 +110,35 @@ func runAgent(configPath, listen, level, format string, output io.Writer) error 
 			errCh <- err
 		}
 	}()
-	go rec.Run(ctx)
+	recDone := make(chan struct{})
+	go func() {
+		defer close(recDone)
+		rec.Run(ctx)
+	}()
 	go watchdog(ctx)
 
 	_ = sdnotify.Ready()
 	_ = sdnotify.Status("serving on " + cfg.Listen)
 	logger.Info("yabd started", "listen", cfg.Listen, "pins", len(cfg.Devices))
 
+	var runErr error
 	select {
 	case <-ctx.Done():
 		// Shutting down must never unbind devices: a stopped agent must not
-		// drop clients that are already attached.
-		logger.Info("shutting down; leaving devices exported")
+		// drop clients that are already attached. But an in-flight bind or
+		// unbind sequence must be allowed to finish, or a device could be left
+		// driverless between two writes.
+		logger.Info("shutting down; waiting for the current reconcile pass")
 	case err := <-errCh:
 		stop()
-		return fmt.Errorf("api server: %w", err)
+		runErr = fmt.Errorf("api server: %w", err)
+	}
+
+	if !waitReconciler(recDone, reconcileDrainTimeout) {
+		logger.Warn("reconciler did not finish in time", "timeout", reconcileDrainTimeout)
+	}
+	if runErr != nil {
+		return runErr
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -130,6 +147,21 @@ func runAgent(configPath, listen, level, format string, output io.Writer) error 
 		logger.Warn("api shutdown", "err", err)
 	}
 	return nil
+}
+
+// reconcileDrainTimeout bounds how long shutdown waits for the reconcile loop
+// to finish the pass it is in.
+const reconcileDrainTimeout = 30 * time.Second
+
+// waitReconciler waits for the reconcile goroutine to exit, reporting false on
+// timeout.
+func waitReconciler(done <-chan struct{}, timeout time.Duration) bool {
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // watchdog resets the systemd watchdog timer until ctx is cancelled.
@@ -146,6 +178,9 @@ func watchdog(ctx context.Context) {
 	}
 }
 
+// tokenHexRe is the same shape the client requires: 64 lower-case hex chars.
+var tokenHexRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
 func readToken(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -154,6 +189,9 @@ func readToken(path string) (string, error) {
 	token := strings.TrimSpace(string(raw))
 	if token == "" {
 		return "", fmt.Errorf("%s is empty", path)
+	}
+	if !tokenHexRe.MatchString(token) {
+		return "", fmt.Errorf("%s must contain exactly 64 lower-case hex characters, got %d characters", path, len(token))
 	}
 	return token, nil
 }

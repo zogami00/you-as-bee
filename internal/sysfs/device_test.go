@@ -1,6 +1,10 @@
 package sysfs
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func buildTree() *FakeFS {
 	const root = "/sys/bus/usb/devices"
@@ -24,7 +28,9 @@ func buildTree() *FakeFS {
 	f.AddFile(root+"/1-1.2/busnum", "1")
 	f.AddFile(root+"/1-1.2/devnum", "5")
 	f.AddFile(root+"/1-1.2/speed", "12")
-	f.AddLink(root+"/1-1.2/driver", "../../../../bus/usb/drivers/btusb")
+	// On a real Pi the device-level driver is "us"; btusb binds to the
+	// interfaces.
+	f.AddLink(root+"/1-1.2/driver", "../../../../bus/usb/drivers/us")
 	f.AddLink(root+"/1-1.2/1-1.2:1.0/driver", "../../../../../bus/usb/drivers/btusb")
 	// Second interface deliberately has no driver link.
 	f.AddDir(root + "/1-1.2/1-1.2:1.1")
@@ -82,8 +88,8 @@ func TestEnumerateMissingSerialTolerated(t *testing.T) {
 	if bt.Speed != "12" {
 		t.Errorf("Speed = %q, want 12", bt.Speed)
 	}
-	if bt.Driver != "btusb" {
-		t.Errorf("Driver = %q, want btusb", bt.Driver)
+	if bt.Driver != "us" {
+		t.Errorf("Driver = %q, want us (device-level driver on a real Pi)", bt.Driver)
 	}
 	if bt.Product != "Bluetooth Dongle (HCI mode)" {
 		t.Errorf("Product = %q", bt.Product)
@@ -122,6 +128,80 @@ func TestEnumerateInterfacesAndStatus(t *testing.T) {
 func TestEnumerateMissingRootIsError(t *testing.T) {
 	if _, err := Enumerate(NewFakeFS(), "/sys/bus/usb/devices"); err == nil {
 		t.Fatal("expected error for missing root, got nil")
+	}
+}
+
+// TestEnumerateSymlinkedDeviceDirectory reproduces the real sysfs layout: each
+// entry in /sys/bus/usb/devices is a symlink to the device directory. A
+// symlinked directory must be enumerated like a real one.
+func TestEnumerateSymlinkedDeviceDirectory(t *testing.T) {
+	const root = "/sys/bus/usb/devices"
+	target := "/sys/devices/platform/soc/usb1/1-1/1-1.2"
+
+	f := NewFakeFS()
+	f.AddLinkDir(root+"/1-1.2", target)
+	f.AddFile(target+"/idVendor", "0A12")
+	f.AddFile(target+"/idProduct", "0001")
+	f.AddFile(target+"/manufacturer", "Cambridge Silicon Radio, Ltd")
+	f.AddFile(target+"/product", "Bluetooth Dongle (HCI mode)")
+	f.AddFile(target+"/devnum", "5")
+	f.AddFile(target+"/usbip_status", "0")
+	f.AddLink(target+"/driver", "/sys/bus/usb/drivers/us")
+	f.AddLinkDir(root+"/1-1.2/1-1.2:1.0", target+"/1-1.2:1.0")
+	f.AddFile(target+"/1-1.2:1.0/idVendor", "0A12")
+	f.AddLink(target+"/1-1.2:1.0/driver", "/sys/bus/usb/drivers/btusb")
+
+	devs, err := Enumerate(f, root)
+	if err != nil {
+		t.Fatalf("Enumerate: %v", err)
+	}
+	if len(devs) != 1 {
+		t.Fatalf("got %d devices, want 1 (the symlinked 1-1.2)", len(devs))
+	}
+	d := devs[0]
+	if d.BusID != "1-1.2" || d.VID != "0a12" || d.PID != "0001" {
+		t.Errorf("device = %+v", d)
+	}
+	if d.Driver != "us" {
+		t.Errorf("Driver = %q, want us", d.Driver)
+	}
+	if len(d.Interfaces) != 1 || d.Interfaces[0].Driver != "btusb" {
+		t.Errorf("Interfaces = %+v, want one with driver btusb", d.Interfaces)
+	}
+}
+
+// TestOSFSReadDirResolvesDirectorySymlink guards the production OSFS, which is
+// the code that actually sees sysfs. It skips when the platform cannot create
+// symlinks (for example an unprivileged Windows session).
+func TestOSFSReadDirResolvesDirectorySymlink(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, filepath.Join(dir, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing"), filepath.Join(dir, "broken")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	ents, err := OSFS{}.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	got := make(map[string]bool, len(ents))
+	for _, e := range ents {
+		got[e.Name] = e.Dir
+	}
+	if !got["real"] {
+		t.Error("real directory reported as non-directory")
+	}
+	if !got["link"] {
+		t.Error("symlink to a directory must be reported as a directory")
+	}
+	if got["broken"] {
+		t.Error("broken symlink must degrade to a non-directory")
 	}
 }
 

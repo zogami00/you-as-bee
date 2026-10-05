@@ -63,7 +63,7 @@ Usage:
   yabd list     [--json] [--all] [--root PATH]
   yabd status   [--config PATH] [--url URL] [--json]
   yabd export   [--config PATH] [--url URL] [--persist] [--force] <selector>
-  yabd unexport [--config PATH] [--url URL] <selector>
+  yabd unexport [--config PATH] [--url URL] [--force] <selector>
   yabd pin      [--config PATH] --name NAME <busid>
   yabd reset    [--config PATH] [--url URL] <name>
   yabd doctor   [--config PATH]

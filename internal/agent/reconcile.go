@@ -49,7 +49,7 @@ type Source interface {
 // Binder binds and unbinds devices from the usbip-host driver.
 type Binder interface {
 	Bind(ctx context.Context, dev sysfs.Device, opts usbiphost.Options) error
-	Unbind(ctx context.Context, dev sysfs.Device) error
+	Unbind(ctx context.Context, dev sysfs.Device, opts usbiphost.Options) error
 }
 
 // Event is a change notification carrying the generation (devnum) the sender
@@ -139,6 +139,18 @@ func (r *Reconciler) logf(format string, args ...any) {
 	}
 }
 
+func (r *Reconciler) warnf(format string, args ...any) {
+	if r.Log != nil {
+		r.Log.Warn(format, args...)
+	}
+}
+
+func (r *Reconciler) errorf(format string, args ...any) {
+	if r.Log != nil {
+		r.Log.Error(format, args...)
+	}
+}
+
 // Run reconciles until ctx is cancelled. It is the only goroutine that calls
 // the Binder.
 func (r *Reconciler) Run(ctx context.Context) {
@@ -165,8 +177,24 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 }
 
+// plannedAction is a bind or unbind the reconciler has decided to perform. It
+// is computed under r.mu and executed while the lock is released, so an API
+// status call never blocks behind a sysfs write or a modprobe.
+type plannedAction struct {
+	pin     string
+	dev     sysfs.Device
+	force   bool
+	recover bool // unbind the current driver before binding
+	release bool // not desired: unbind only
+	err     error
+}
+
 // ReconcileOnce performs a single reconciliation pass. It is idempotent: when
 // nothing changed since the previous pass it performs no bind or unbind calls.
+//
+// The lock is held only to snapshot the desired state and to commit the
+// outcome; the Binder (and therefore sysfs writes and modprobe) runs outside
+// it. The reconcile goroutine remains the only writer to sysfs.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	devs, err := r.Source.Enumerate()
 	if err != nil {
@@ -174,115 +202,161 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	}
 	resolved, ambiguities, _ := identity.Resolve(r.Pins, devs)
 	for _, a := range ambiguities {
-		r.logf("pin %q is ambiguous: %d devices match", a.Pin, len(a.Devices))
+		r.warnf("pin %q is ambiguous: %d devices match it", a.Pin, len(a.Devices))
 	}
 
-	now := r.now()
-
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	planNow := r.now()
 	for _, d := range devs {
 		r.gens[d.BusID] = d.DevNum
 	}
-
+	plans := make([]plannedAction, 0, len(r.Pins))
 	for _, pin := range r.Pins {
-		rec := r.recordLocked(pin.Name)
 		dev, present := resolved[pin.Name]
-		desired := pin.Mode == config.ModeAlways || r.explicit[pin.Name]
-
-		if !present {
-			rec.state = Absent
-			rec.exportedAt = time.Time{}
-			continue
+		if p, ok := r.planLocked(pin, dev, present, planNow); ok {
+			plans = append(plans, p)
 		}
+	}
+	r.mu.Unlock()
 
-		// Quarantine: cleared only by the timer or an explicit reset.
-		if rec.state == Quarantined {
-			if now.Before(rec.quarantineUntil) {
+	// Execute the slow work without holding the lock.
+	for i := range plans {
+		p := &plans[i]
+		switch {
+		case p.release:
+			p.err = r.Binder.Unbind(ctx, p.dev, usbiphost.Options{Force: p.force})
+		case p.recover:
+			if err := r.Binder.Unbind(ctx, p.dev, usbiphost.Options{Force: p.force}); err != nil {
+				p.err = err
 				continue
 			}
-			rec.state = Present
-			rec.failures = nil
-			rec.backoff = 0
-			rec.nextAttempt = time.Time{}
+			p.err = r.Binder.Bind(ctx, p.dev, usbiphost.Options{Force: p.force})
+		default:
+			p.err = r.Binder.Bind(ctx, p.dev, usbiphost.Options{Force: p.force})
 		}
-
-		// Once a device has stayed exported long enough, forget past failures.
-		if rec.state == Exported && !rec.exportedAt.IsZero() && now.Sub(rec.exportedAt) >= exportedStable {
-			rec.backoff = 0
-			rec.failures = nil
-		}
-
-		healthy := dev.Driver == driverName && dev.Status == statusOK
-		exported := dev.Driver == driverName && (dev.Status == statusOK || dev.Status == statusInUse)
-
-		// A client is attached: never disturb it. Wait until it detaches
-		// (status returns to 1) before acting again.
-		if dev.Status == statusInUse {
-			rec.state = Attached
-			rec.exportedAt = now
-			continue
-		}
-
-		if desired {
-			if healthy && rec.gen == dev.DevNum {
-				if rec.state != Exported {
-					rec.state = Exported
-				}
-				if rec.exportedAt.IsZero() {
-					rec.exportedAt = now
-				}
-				continue
-			}
-			if now.Before(rec.nextAttempt) {
-				rec.state = Backoff
-				continue
-			}
-			// Recovery: a full unbind/rebind is required when a client error
-			// was reported, when the device sits on the wrong driver, or when
-			// a previously exported device is no longer healthy.
-			wrongDriver := dev.Driver != "" && dev.Driver != driverName
-			if dev.Status == statusFailed || wrongDriver || rec.state == Exported {
-				if err := r.Binder.Unbind(ctx, dev); err != nil {
-					r.logf("unbind %s: %v", dev.BusID, err)
-					r.failLocked(rec, now)
-					continue
-				}
-			}
-			rec.state = Binding
-			if err := r.Binder.Bind(ctx, dev, usbiphost.Options{Force: r.force[pin.Name]}); err != nil {
-				r.logf("bind %s: %v", dev.BusID, err)
-				r.failLocked(rec, now)
-				continue
-			}
-			rec.gen = dev.DevNum
-			rec.exportedAt = now
-			rec.state = Exported
-			continue
-		}
-
-		// Not desired: release anything we exported.
-		if exported || rec.state == Exported || rec.state == Attached {
-			if err := r.Binder.Unbind(ctx, dev); err != nil {
-				r.logf("unbind %s: %v", dev.BusID, err)
-				r.failLocked(rec, now)
-				continue
-			}
-			rec.gen = 0
-		}
-		rec.state = Present
-		rec.exportedAt = time.Time{}
 	}
 
-	r.rebuildSnapshotLocked(resolved, now)
+	// Commit the outcome and rebuild the snapshot under the lock again.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	commitNow := r.now()
+	for i := range plans {
+		r.commitLocked(&plans[i], commitNow)
+	}
+	r.rebuildSnapshotLocked(resolved, commitNow)
 	return nil
+}
+
+// planLocked updates the in-memory state that needs no Binder call and returns
+// the bind/unbind action for a pin, if any. The caller must hold r.mu.
+func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, present bool, now time.Time) (plannedAction, bool) {
+	rec := r.recordLocked(pin.Name)
+	desired := pin.Mode == config.ModeAlways || r.explicit[pin.Name]
+
+	if !present {
+		rec.state = Absent
+		rec.exportedAt = time.Time{}
+		return plannedAction{}, false
+	}
+
+	// Quarantine: cleared only by the timer or an explicit reset.
+	if rec.state == Quarantined {
+		if now.Before(rec.quarantineUntil) {
+			return plannedAction{}, false
+		}
+		rec.state = Present
+		rec.failures = nil
+		rec.backoff = 0
+		rec.nextAttempt = time.Time{}
+	}
+
+	// Once a device has stayed exported long enough, forget past failures.
+	if rec.state == Exported && !rec.exportedAt.IsZero() && now.Sub(rec.exportedAt) >= exportedStable {
+		rec.backoff = 0
+		rec.failures = nil
+	}
+
+	healthy := dev.Driver == driverName && dev.Status == statusOK
+	exported := dev.Driver == driverName && (dev.Status == statusOK || dev.Status == statusInUse)
+
+	// A client is attached: never disturb it. Wait until it detaches (status
+	// returns to 1) before acting again.
+	if dev.Status == statusInUse {
+		rec.state = Attached
+		rec.exportedAt = now
+		return plannedAction{}, false
+	}
+
+	if desired {
+		if healthy && rec.gen == dev.DevNum {
+			if rec.state != Exported {
+				rec.state = Exported
+			}
+			if rec.exportedAt.IsZero() {
+				rec.exportedAt = now
+			}
+			return plannedAction{}, false
+		}
+		if now.Before(rec.nextAttempt) {
+			rec.state = Backoff
+			return plannedAction{}, false
+		}
+		// Recovery: a full unbind/rebind is required when a client error was
+		// reported, when the device sits on the wrong driver, or when a
+		// previously exported device is no longer healthy.
+		wasExported := rec.state == Exported
+		wrongDriver := dev.Driver != "" && dev.Driver != driverName
+		rec.state = Binding
+		return plannedAction{
+			pin:     pin.Name,
+			dev:     dev,
+			force:   r.force[pin.Name],
+			recover: dev.Status == statusFailed || wrongDriver || wasExported,
+		}, true
+	}
+
+	// Not desired: release anything we exported.
+	if exported || rec.state == Exported || rec.state == Attached {
+		rec.state = Present
+		return plannedAction{pin: pin.Name, dev: dev, force: r.force[pin.Name], release: true}, true
+	}
+	rec.state = Present
+	rec.exportedAt = time.Time{}
+	return plannedAction{}, false
+}
+
+// commitLocked applies the result of a performed action to the device record.
+// The caller must hold r.mu.
+func (r *Reconciler) commitLocked(p *plannedAction, now time.Time) {
+	rec := r.recordLocked(p.pin)
+	if p.release {
+		if p.err != nil {
+			r.warnf("unbind %s failed: %v", p.dev.BusID, p.err)
+			r.failLocked(p.pin, rec, now)
+			return
+		}
+		rec.gen = 0
+		rec.state = Present
+		rec.exportedAt = time.Time{}
+		return
+	}
+
+	// A forced bind is one-shot: it is consumed by the pass that acted on it.
+	delete(r.force, p.pin)
+	if p.err != nil {
+		r.warnf("bind %s failed: %v", p.dev.BusID, p.err)
+		r.failLocked(p.pin, rec, now)
+		return
+	}
+	rec.gen = p.dev.DevNum
+	rec.exportedAt = now
+	rec.state = Exported
 }
 
 // failLocked records a bind/reset failure, grows the backoff, and trips the
 // quarantine circuit breaker when failures stack up inside the window. The
 // caller must hold r.mu.
-func (r *Reconciler) failLocked(rec *record, now time.Time) {
+func (r *Reconciler) failLocked(pin string, rec *record, now time.Time) {
 	rec.failures = append(rec.failures, now)
 	cut := now.Add(-failureWindow)
 	kept := rec.failures[:0]
@@ -297,6 +371,7 @@ func (r *Reconciler) failLocked(rec *record, now time.Time) {
 		rec.state = Quarantined
 		rec.quarantineUntil = now.Add(quarantinePeriod)
 		rec.nextAttempt = rec.quarantineUntil
+		r.errorf("pin %q quarantined for %s after %d failures", pin, quarantinePeriod, len(rec.failures))
 		return
 	}
 
@@ -309,8 +384,14 @@ func (r *Reconciler) failLocked(rec *record, now time.Time) {
 		}
 	}
 	jitter := 1 + (r.rand()-0.5)*2*jitterFraction
-	rec.nextAttempt = now.Add(time.Duration(float64(rec.backoff) * jitter))
+	delay := time.Duration(float64(rec.backoff) * jitter)
+	// Apply the ceiling after jitter so the real delay never exceeds the cap.
+	if delay > maxBackoff {
+		delay = maxBackoff
+	}
+	rec.nextAttempt = now.Add(delay)
 	rec.state = Backoff
+	r.warnf("pin %q failed, retrying in %s", pin, delay)
 }
 
 // rebuildSnapshotLocked republishes the device snapshot and emits events for
@@ -369,7 +450,9 @@ func (r *Reconciler) signal() {
 	}
 }
 
-// Export marks a pin for export (or stores a one-shot force for it).
+// Export marks a pin for export. A force is one-shot: it is consumed by the
+// next reconciliation pass that acts on the pin, then cleared, so a later
+// attach is refused unless forced again.
 func (r *Reconciler) Export(_ context.Context, id string, force bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

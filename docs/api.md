@@ -31,7 +31,7 @@ There is **no TLS**. See [security.md](security.md).
 | GET | `/v1/info` | Agent version, hostname, uptime and `usbipd` state. |
 | GET | `/v1/devices` | All configured pins with their current state. |
 | GET | `/v1/devices/{id}` | One pin. |
-| POST | `/v1/devices/{id}/export` | Ask the agent to export the device. |
+| POST | `/v1/devices/{id}/export` | Ask the agent to export the device (`202`, asynchronous). |
 | POST | `/v1/devices/{id}/unexport` | Release the device from `usbip-host`. |
 | POST | `/v1/devices/{id}/reset` | Clear backoff, failures and quarantine. |
 | GET | `/v1/events` | Server-sent event stream. |
@@ -43,11 +43,18 @@ disturbing a device a client is already attached to.
 
 ## Request and response bodies
 
-There are no request bodies. `POST` responses are:
+There are no request bodies. `POST /v1/devices/{id}/unexport` and `reset`
+return `200 OK` with:
 
 ```json
 { "status": "ok" }
 ```
+
+`POST /v1/devices/{id}/export` returns `202 Accepted` with
+`{ "status": "accepted" }`: the bind happens on the reconcile loop, so the
+response acknowledges the request rather than confirming it. A caller that
+needs to report success must poll `GET /v1/devices/{id}` until `state` is
+`exported` or `in_use`. `yabd export` does exactly this.
 
 ### GET /v1/info
 
@@ -126,7 +133,7 @@ Errors use one shape:
 | 401 | `unauthorized` | Missing or wrong bearer token. |
 | 403 | `forbidden` | Peer address not in `allowed_clients`. |
 | 404 | `not_found` | Unknown device id. |
-| 500 | `internal` | Backend failure (message carries the detail). |
+| 500 | `internal` | Backend failure. The message is generic; the detail is logged, never returned. |
 | 500 | `sse_unsupported` | Response writer cannot stream (should not happen with net/http). |
 
 The typed Go client maps any non-2xx to an `APIError`; if the body is not the
@@ -151,6 +158,4 @@ curl -sS -N -H "Authorization: Bearer $TOKEN" \
   -H "Accept: text/event-stream" http://raspberrypi.local:3241/v1/events
 ```
 
-Note: the Go type comments in `internal/proto/types.go` refer to `/api/v1/...`
-paths; the routes actually served are `/v1/...` (no `/api` prefix). The
-comments are stale.
+

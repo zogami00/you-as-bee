@@ -43,7 +43,7 @@ type Device struct {
 	Mode string `json:"mode"`
 }
 
-// Info describes the agent itself (GET /api/v1/info).
+// Info describes the agent itself (GET /v1/info).
 type Info struct {
 	Version   string `json:"version"`
 	Hostname  string `json:"hostname"`
@@ -57,12 +57,12 @@ type Error struct {
 	Message string `json:"message"`
 }
 
-// ListDevicesResponse is the body of GET /api/v1/devices.
+// ListDevicesResponse is the body of GET /v1/devices.
 type ListDevicesResponse struct {
 	Devices []Device `json:"devices"`
 }
 
-// Event is one server-sent event (GET /api/v1/events).
+// Event is one server-sent event (GET /v1/events).
 type Event struct {
 	// Type is one of the Event* constants.
 	Type   string    `json:"type"`

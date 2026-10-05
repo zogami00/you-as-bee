@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -140,13 +141,22 @@ func cmdExport(args []string, stdout, stderr io.Writer) int {
 	// Prefer the running agent so we cannot race the reconciler.
 	client, cerr := newAPIClient(*configPath, *rawURL)
 	if cerr == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), exportConfirmTimeout)
 		err := client.Export(ctx, sel.raw, *force)
-		cancel()
 		if err == nil {
-			fmt.Fprintf(stdout, "exported %s\n", sel.raw)
+			// The API accepted the request; the bind happens on the
+			// reconciler. Only claim success once the device really is
+			// exported.
+			dev, werr := waitForExported(ctx, client, sel.raw)
+			cancel()
+			if werr != nil {
+				fmt.Fprintf(stderr, "yabd export: %v\n", werr)
+				return 1
+			}
+			fmt.Fprintf(stdout, "exported %s (%s)\n", sel.raw, dev.State)
 			return 0
 		}
+		cancel()
 		if reachedAPI(err) {
 			fmt.Fprintf(stderr, "yabd export: %v\n", err)
 			return 1
@@ -156,10 +166,39 @@ func cmdExport(args []string, stdout, stderr io.Writer) int {
 	return directBind(*configPath, sel, *force, stdout, stderr)
 }
 
+// exportConfirmTimeout bounds how long the CLI waits for the agent to actually
+// reach the exported state after accepting an export request.
+const exportConfirmTimeout = 30 * time.Second
+
+// waitForExported polls the agent until the device is exported (or in use by a
+// client), returning an error on a real absence, a backend error or timeout.
+func waitForExported(ctx context.Context, client *api.Client, id string) (proto.Device, error) {
+	for {
+		dev, err := client.Device(ctx, id)
+		if err == nil {
+			switch dev.State {
+			case proto.StateExported, proto.StateInUse:
+				return dev, nil
+			case proto.StateAbsent:
+				return dev, fmt.Errorf("%s is not present on the agent", id)
+			}
+		} else if !api.IsNotFound(err) {
+			return proto.Device{}, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return proto.Device{}, fmt.Errorf("timed out waiting for %s to reach the exported state", id)
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 func cmdUnexport(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("unexport")
 	configPath := fs.String("config", defaultConfigPath, "path to the agent config file")
 	rawURL := fs.String("url", "", "agent API base URL")
+	force := fs.Bool("force", false, "release a device a client is attached to")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -187,7 +226,7 @@ func cmdUnexport(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	return directUnbind(*configPath, sel, stdout, stderr)
+	return directUnbind(*configPath, sel, *force, stdout, stderr)
 }
 
 func cmdReset(args []string, stdout, stderr io.Writer) int {
@@ -334,7 +373,7 @@ func directBind(configPath string, sel selector, force bool, stdout, stderr io.W
 	return 0
 }
 
-func directUnbind(configPath string, sel selector, stdout, stderr io.Writer) int {
+func directUnbind(configPath string, sel selector, force bool, stdout, stderr io.Writer) int {
 	var cfg config.AgentConfig
 	if err := config.Load(configPath, &cfg); err != nil {
 		fmt.Fprintf(stderr, "yabd unexport: %v\n", err)
@@ -348,7 +387,7 @@ func directUnbind(configPath string, sel selector, stdout, stderr io.Writer) int
 	binder := usbiphost.New()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := binder.Unbind(ctx, dev); err != nil {
+	if err := binder.Unbind(ctx, dev, usbiphost.Options{Force: force}); err != nil {
 		fmt.Fprintf(stderr, "yabd unexport: %v\n", err)
 		return 1
 	}
@@ -397,6 +436,9 @@ func isConnError(err error) bool {
 	return errors.As(err, &op)
 }
 
+// saveConfig writes the config atomically: a temp file in the same directory is
+// fully written and flushed, then renamed over the target, so a crash mid-write
+// never leaves a truncated config.
 func saveConfig(path string, cfg *config.AgentConfig) error {
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -406,5 +448,24 @@ func saveConfig(path string, cfg *config.AgentConfig) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".you-as-bee-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }

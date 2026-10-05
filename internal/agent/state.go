@@ -19,8 +19,6 @@ const (
 	Backoff
 	// Quarantined means repeated failures paused all work on the device.
 	Quarantined
-	// Disabled means the device was administratively disabled.
-	Disabled
 )
 
 // String returns the lower-case name of the state.
@@ -40,8 +38,6 @@ func (s State) String() string {
 		return "backoff"
 	case Quarantined:
 		return "quarantined"
-	case Disabled:
-		return "disabled"
 	default:
 		return "unknown"
 	}

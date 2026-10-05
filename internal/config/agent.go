@@ -27,11 +27,11 @@ var (
 	hexQuadRe    = regexp.MustCompile(`^[0-9a-fA-F]{4}$`)
 )
 
-// USBIPConfig locates and controls the Linux USB/IP tooling.
+// USBIPConfig locates the Linux USB/IP tooling. The usbipd daemon is run by
+// systemd, not by the agent, so there is no manage flag here.
 type USBIPConfig struct {
-	Bin          string `json:"bin"`
-	UsbipdBin    string `json:"usbipd_bin"`
-	ManageUsbipd bool   `json:"manage_usbipd"`
+	Bin       string `json:"bin"`
+	UsbipdBin string `json:"usbipd_bin"`
 }
 
 // DeviceConfig describes a single USB device the agent should manage.
@@ -82,7 +82,6 @@ func (c *AgentConfig) setDefaults() {
 	c.PollInterval = Duration(5 * time.Second)
 	c.USBIP.Bin = "/usr/sbin/usbip"
 	c.USBIP.UsbipdBin = "/usr/sbin/usbipd"
-	c.USBIP.ManageUsbipd = true
 	c.LogLevel = "info"
 	c.LogFormat = "text"
 }

@@ -3,6 +3,7 @@ package usbiphost
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -96,7 +97,8 @@ const (
 	testDrvLn  = testDevDir + "/driver"
 )
 
-// newBoundTestFS builds a tree for a Bluetooth dongle currently on btusb.
+// newBoundTestFS builds a tree for a Bluetooth dongle currently on the generic
+// "us" device driver (btusb binds to the interface, not the device).
 func newBoundTestFS() *fakeSysFS {
 	f := newFakeSysFS()
 	f.addFile(testDevDir+"/idVendor", "0a12")
@@ -105,7 +107,7 @@ func newBoundTestFS() *fakeSysFS {
 	f.addFile(testDevDir+"/usbip_status", "0")
 	f.addFile(testPower, "auto")
 	f.addFile(testMatch, "")
-	f.addLink(testDrvLn, testRoot+"/bus/usb/drivers/btusb")
+	f.addLink(testDrvLn, testRoot+"/bus/usb/drivers/us")
 	return f
 }
 
@@ -162,6 +164,99 @@ func TestBindRollbackOnVerifyFailure(t *testing.T) {
 		t.Errorf("error = %v, want ErrRolledBack", err)
 	}
 
+	assertWrites(t, f, []writeOp{
+		{testPower, "on"},
+		{testMatch, "add " + testBusID},
+		{testUnbnd, testBusID},
+		{testBind, testBusID},
+		{testUnbind, testBusID},
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+		{testPower, "auto"},
+	})
+}
+
+// The four tests below fail a bind step after the power write and assert the
+// exact ordered rollback. Only the verify failure was covered before.
+func TestBindPowerFailureDoesNotRollBack(t *testing.T) {
+	f := newBoundTestFS()
+	f.onWrite = func(name, _ string) error {
+		if name == testPower {
+			return errors.New("write: operation not permitted")
+		}
+		return nil
+	}
+
+	err := newBinder(f).Bind(context.Background(), testDevice(), Options{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrRolledBack) {
+		t.Errorf("error = %v; nothing changed, must not report a rollback", err)
+	}
+	assertWrites(t, f, []writeOp{{testPower, "on"}})
+}
+
+func TestBindMatchBusidAddFailureRollsBack(t *testing.T) {
+	f := newBoundTestFS()
+	f.onWrite = func(name, data string) error {
+		if name == testMatch && strings.HasPrefix(data, "add") {
+			return errors.New("write: operation not permitted")
+		}
+		return nil
+	}
+
+	err := newBinder(f).Bind(context.Background(), testDevice(), Options{})
+	if !errors.Is(err, ErrRolledBack) {
+		t.Errorf("error = %v, want ErrRolledBack", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testPower, "on"},
+		{testMatch, "add " + testBusID},
+		{testUnbind, testBusID},
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+		{testPower, "auto"},
+	})
+}
+
+func TestBindDriverUnbindFailureRollsBack(t *testing.T) {
+	f := newBoundTestFS()
+	f.onWrite = func(name, _ string) error {
+		if name == testUnbnd {
+			return errors.New("write: no such device")
+		}
+		return nil
+	}
+
+	err := newBinder(f).Bind(context.Background(), testDevice(), Options{})
+	if !errors.Is(err, ErrRolledBack) {
+		t.Errorf("error = %v, want ErrRolledBack", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testPower, "on"},
+		{testMatch, "add " + testBusID},
+		{testUnbnd, testBusID},
+		{testUnbind, testBusID},
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+		{testPower, "auto"},
+	})
+}
+
+func TestBindUsbipHostBindFailureRollsBack(t *testing.T) {
+	f := newBoundTestFS()
+	f.onWrite = func(name, _ string) error {
+		if name == testBind {
+			return errors.New("write: no such device")
+		}
+		return nil
+	}
+
+	err := newBinder(f).Bind(context.Background(), testDevice(), Options{})
+	if !errors.Is(err, ErrRolledBack) {
+		t.Errorf("error = %v, want ErrRolledBack", err)
+	}
 	assertWrites(t, f, []writeOp{
 		{testPower, "on"},
 		{testMatch, "add " + testBusID},
@@ -234,9 +329,85 @@ func TestUnbindSequence(t *testing.T) {
 	f := newBoundTestFS()
 	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
 	f.files[testDevDir+"/usbip_status"] = "1"
+	f.files[testPower] = "on" // bind set autosuspend off; Unbind must restore it
 
-	if err := newBinder(f).Unbind(context.Background(), testDevice()); err != nil {
+	if err := newBinder(f).Unbind(context.Background(), testDevice(), Options{}); err != nil {
 		t.Fatalf("Unbind: %v", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testUnbind, testBusID},
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+		{testPower, "auto"},
+	})
+}
+
+// TestUnbindCompletesStepsWhenDriverAbsent covers a device that is no longer on
+// usbip-host (for example after an interrupted Unbind): the remaining steps
+// must still run so it cannot be left driverless.
+func TestUnbindCompletesStepsWhenDriverAbsent(t *testing.T) {
+	f := newBoundTestFS() // on "us", status 0
+
+	if err := newBinder(f).Unbind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("Unbind: %v", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+	})
+}
+
+func TestUnbindRefusesAttachedWithoutForce(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "2"
+
+	err := newBinder(f).Unbind(context.Background(), testDevice(), Options{})
+	if !errors.Is(err, ErrInUse) {
+		t.Errorf("error = %v, want ErrInUse", err)
+	}
+	if len(f.writes) != 0 {
+		t.Errorf("writes = %v, want none", f.writes)
+	}
+}
+
+func TestUnbindForceAllowsAttached(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "2"
+
+	if err := newBinder(f).Unbind(context.Background(), testDevice(), Options{Force: true}); err != nil {
+		t.Fatalf("Unbind with Force: %v", err)
+	}
+}
+
+// TestUnbindFailedFirstWriteThenRetry: the usbip-host/unbind write fails, so
+// the device is untouched. The retry must complete the whole sequence.
+func TestUnbindFailedFirstWriteThenRetry(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "1"
+	failUnbind := true
+	f.onWrite = func(name, _ string) error {
+		if name == testUnbind && failUnbind {
+			return errors.New("write: input/output error")
+		}
+		if name == testUnbind {
+			delete(f.links, testDrvLn)
+			f.files[testDevDir+"/usbip_status"] = "0"
+		}
+		return nil
+	}
+
+	b := newBinder(f)
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err == nil {
+		t.Fatal("first Unbind: expected error, got nil")
+	}
+	f.writes = nil
+	failUnbind = false
+
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("retry Unbind: %v", err)
 	}
 	assertWrites(t, f, []writeOp{
 		{testUnbind, testBusID},
@@ -245,14 +416,57 @@ func TestUnbindSequence(t *testing.T) {
 	})
 }
 
-func TestUnbindNoopWhenUnexported(t *testing.T) {
-	f := newBoundTestFS() // on btusb, status 0
-
-	if err := newBinder(f).Unbind(context.Background(), testDevice()); err != nil {
-		t.Fatalf("Unbind: %v", err)
+// TestUnbindRetryAfterMidSequenceFailure: usbip-host/unbind succeeds but
+// match_busid del fails, leaving the device off usbip-host. Because the old
+// code treated a driverless device as a no-op, the retry must still drop the
+// busid claim and re-probe.
+func TestUnbindRetryAfterMidSequenceFailure(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "1"
+	failMatch := true
+	f.onWrite = func(name, _ string) error {
+		if name == testUnbind {
+			delete(f.links, testDrvLn) // device is now driverless
+			f.files[testDevDir+"/usbip_status"] = "0"
+		}
+		if name == testMatch && failMatch {
+			return errors.New("write: invalid argument")
+		}
+		return nil
 	}
-	if len(f.writes) != 0 {
-		t.Errorf("writes = %v, want none", f.writes)
+
+	b := newBinder(f)
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err == nil {
+		t.Fatal("first Unbind: expected error, got nil")
+	}
+	f.writes = nil
+	failMatch = false
+
+	if err := b.Unbind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("retry Unbind: %v", err)
+	}
+	// The retry must not try to unbind usbip-host again (the driver is gone),
+	// but it must still drop the claim and cause a re-probe.
+	assertWrites(t, f, []writeOp{
+		{testMatch, "del " + testBusID},
+		{testProbe, testBusID},
+	})
+}
+
+func TestUnbindToleratesMissingMatchBusid(t *testing.T) {
+	f := newBoundTestFS()
+	f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+	f.files[testDevDir+"/usbip_status"] = "1"
+	f.onWrite = func(name, _ string) error {
+		if name == testMatch {
+			return os.ErrInvalid // EINVAL: busid was never added
+		}
+		return nil
+	}
+
+	if err := newBinder(f).Unbind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("Unbind with EINVAL on match_busid: %v", err)
 	}
 }
 
@@ -279,7 +493,8 @@ func TestPreflightModuleMissing(t *testing.T) {
 func TestPreflightLoadsModule(t *testing.T) {
 	f := newFakeSysFS()
 	b := newBinder(f)
-	b.Runner = &loadingRunner{fs: f, path: testMatch}
+	runner := &loadingRunner{fs: f, path: testMatch}
+	b.Runner = runner
 
 	// The runner fakes modprobe by creating the match_busid file, which makes
 	// the usbip-host directory exist. The device itself is still missing, so
@@ -292,6 +507,16 @@ func TestPreflightLoadsModule(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a bind error for a missing device")
 	}
+	if runner.calls != 1 {
+		t.Fatalf("modprobe called %d times, want 1", runner.calls)
+	}
+	if runner.path0 != "/sbin/modprobe" {
+		t.Errorf("modprobe path = %q, want /sbin/modprobe", runner.path0)
+	}
+	wantArgs := "-a,usbip-core,usbip-host"
+	if got := strings.Join(runner.args0, ","); got != wantArgs {
+		t.Errorf("modprobe args = %q, want %q", got, wantArgs)
+	}
 }
 
 // fixedRunner always returns the configured error.
@@ -301,13 +526,22 @@ func (r fixedRunner) Run(_ context.Context, _ string, _ ...string) (string, stri
 	return "", "", r.err
 }
 
-// loadingRunner simulates modprobe creating the usbip-host directory.
+// loadingRunner simulates modprobe creating the usbip-host directory and
+// records how it was invoked.
 type loadingRunner struct {
-	fs   *fakeSysFS
-	path string
+	fs    *fakeSysFS
+	path  string
+	calls int
+	path0 string
+	args0 []string
 }
 
-func (r *loadingRunner) Run(_ context.Context, _ string, _ ...string) (string, string, error) {
+func (r *loadingRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
+	r.calls++
+	if r.path0 == "" {
+		r.path0 = name
+		r.args0 = append([]string(nil), args...)
+	}
 	r.fs.files[r.path] = ""
 	return "", "", nil
 }

@@ -26,8 +26,7 @@ The agent config lives at `/etc/you-as-bee/agent.json`; the client config at
 | `allowed_clients` | string[] | RFC1918 ranges | CIDR allowlist for the API, checked against the connection's peer address. |
 | `poll_interval` | duration | `5s` | Reconcile period. Must be positive. |
 | `usbip.bin` | string | `/usr/sbin/usbip` | Path to the `usbip` client tool. |
-| `usbip.usbipd_bin` | string | `/usr/sbin/usbipd` | Path to the `usbipd` daemon. |
-| `usbip.manage_usbipd` | bool | `true` | Parsed and validated but not read by the runtime today; `usbipd` is always run as its own systemd unit. |
+| `usbip.usbipd_bin` | string | `/usr/sbin/usbipd` | Path to the `usbipd` daemon. `usbipd` runs as its own systemd unit; the agent never starts or stops it. |
 | `devices[].name` | string | - | Stable pin id, `^[a-z0-9-]{1,32}$`, unique. |
 | `devices[].vid` | string | - | 4-hex-digit vendor id; case-normalised to lower case. |
 | `devices[].pid` | string | - | 4-hex-digit product id; case-normalised to lower case. |
@@ -77,8 +76,7 @@ This is `deploy/pi/agent.example.json` (and what `provision.sh` derives
   "poll_interval": "5s",
   "usbip": {
     "bin": "/usr/sbin/usbip",
-    "usbipd_bin": "/usr/sbin/usbipd",
-    "manage_usbipd": true
+    "usbipd_bin": "/usr/sbin/usbipd"
   },
   "devices": [
     {

@@ -38,27 +38,32 @@ type Config struct {
 	AllowedClients []string
 	// Backend supplies device state.
 	Backend Backend
+	// UnknownErr is the sentinel a backend uses to signal "unknown device". It
+	// is wired at construction so the api package never imports the agent.
+	UnknownErr error
 	// Log receives request errors. May be nil.
 	Log *slog.Logger
 }
 
 // Server is the management HTTP server.
 type Server struct {
-	token   string
-	allowed []*net.IPNet
-	backend Backend
-	log     *slog.Logger
-	mux     *http.ServeMux
-	http    *http.Server
+	token      string
+	allowed    []*net.IPNet
+	backend    Backend
+	unknownErr error
+	log        *slog.Logger
+	mux        *http.ServeMux
+	http       *http.Server
 }
 
 // New builds a Server from cfg.
 func New(cfg Config) (*Server, error) {
 	s := &Server{
-		token:   cfg.Token,
-		backend: cfg.Backend,
-		log:     cfg.Log,
-		mux:     http.NewServeMux(),
+		token:      cfg.Token,
+		backend:    cfg.Backend,
+		unknownErr: cfg.UnknownErr,
+		log:        cfg.Log,
+		mux:        http.NewServeMux(),
 	}
 	for _, cidr := range cfg.AllowedClients {
 		_, network, err := net.ParseCIDR(cidr)
@@ -147,7 +152,10 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		s.backendError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	// The bind itself runs on the reconcile goroutine, so this is an
+	// acknowledgement, not a completion. Callers confirm the device's state
+	// before reporting success.
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }
 
 func (s *Server) handleUnexport(w http.ResponseWriter, r *http.Request) {
@@ -207,27 +215,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) backendError(w http.ResponseWriter, err error) {
-	if errors.Is(err, unknownDeviceErr) {
+	if s.unknownErr != nil && errors.Is(err, s.unknownErr) {
 		writeError(w, http.StatusNotFound, "not_found", "unknown device")
 		return
 	}
+	// Log the detail (which can name sysfs paths) but never return it to the
+	// caller.
 	if s.log != nil {
 		s.log.Warn("api: request failed", "err", err)
 	}
-	writeError(w, http.StatusInternalServerError, "internal", err.Error())
-}
-
-// unknownDeviceErr is the sentinel matched by backendError. It defaults to a
-// private error and is overridden through SetUnknownError so that the api
-// package does not import the agent package just to compare its ErrUnknown.
-var unknownDeviceErr = errors.New("api: unknown device")
-
-// SetUnknownError overrides the sentinel matched by backendError. The wiring
-// passes agent.ErrUnknown.
-func SetUnknownError(err error) {
-	if err != nil {
-		unknownDeviceErr = err
-	}
+	writeError(w, http.StatusInternalServerError, "internal", "internal error")
 }
 
 func writeEvent(w http.ResponseWriter, ev proto.Event) {
