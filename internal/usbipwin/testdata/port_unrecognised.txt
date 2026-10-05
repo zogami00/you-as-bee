@@ -1,0 +1,5 @@
+# SYNTHESISED fixture. Not captured from a real usbip-win2 installation. This
+# deliberately contains no port block and no recognised header, so the parser
+# must report ErrUnrecognised rather than an empty success.
+error: unable to open the vhci driver
+some unrelated diagnostic text follows

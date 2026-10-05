@@ -1,0 +1,43 @@
+[Unit]
+Description=you-as-bee USB-over-LAN agent
+Documentation=https://github.com/zogami00/you-as-bee
+Wants=network-online.target usbipd.service
+After=network-online.target usbipd.service systemd-udevd.service
+# Never give up restarting: losing the agent on a headless Pi is worse than a
+# restart loop, and the device state is recovered by the reconciler.
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+WatchdogSec=30
+Restart=always
+RestartSec=2
+ExecStart=/usr/local/bin/yabd run --config /etc/you-as-bee/agent.json
+User=root
+Group=root
+# Hardening. The agent writes sysfs to bind devices and reads its config and
+# token from /etc, and nothing else.
+#
+# StateDirectory=you-as-bee makes systemd create and own /var/lib/you-as-bee
+# before the mount namespace is set up. It is provisioned for future use; the
+# daemon does not write there today (nothing in the code references it). It must
+# NOT also be listed in ReadWritePaths=: ReadWritePaths= is applied first and,
+# under ProtectSystem=strict, a path there that does not already exist makes the
+# unit die with 226/NAMESPACE and crash-loop forever. Letting systemd own the
+# directory removes that ordering hazard.
+#
+# ConfigurationDirectory=you-as-bee is deliberately absent. The daemon only
+# *reads* /etc/you-as-bee/agent.json and /etc/you-as-bee/token; the writers are
+# `yabd pin` and `yabd export --persist` (cmd/yabd/cli.go:saveConfig, reached
+# through cmdPin/setPinMode), which run outside this unit. ProtectSystem=strict
+# still permits reading /etc, so the token stays reachable without granting
+# write access the daemon never uses.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/sys
+StateDirectory=you-as-bee
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

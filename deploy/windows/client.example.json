@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "servers": [
+    {
+      "name": "pi",
+      "host": "raspberrypi.local",
+      "api_port": 3241,
+      "token": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "usbip_path": "",
+  "auto_attach": [
+    {
+      "server": "pi",
+      "device": "xbox-wireless"
+    },
+    {
+      "server": "pi",
+      "device": "bluetooth"
+    }
+  ],
+  "reconnect": {
+    "initial": "1s",
+    "max": "30s"
+  },
+  "command_timeout": "15s",
+  "receive_mode": "low-latency",
+  "log_file": "",
+  "log_level": "info"
+}

@@ -1,3 +1,12 @@
-dist/
+# Build output
+/dist/
 *.exe
+
+# Go test and profile artefacts
+*.test
+*.out
+coverage.txt
+*.prof
+
+# Local dashboard (orchestrator-only, not committed)
 .dashboard/

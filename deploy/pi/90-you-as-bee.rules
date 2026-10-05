@@ -1,0 +1,6 @@
+# you-as-bee: disable USB autosuspend for the pinned export devices so they are
+# not power-managed while exported over the LAN. Replace or extend the
+# idVendor/idProduct pairs to match the devices configured in agent.json.
+
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0a12", ATTR{idProduct}=="0001", ATTR{power/control}="on"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02e6", ATTR{power/control}="on"

@@ -1,0 +1,12 @@
+# SYNTHESISED fixture. Not captured from a real usbip-win2 installation; the
+# shape is modelled on `usbip port` for two attached devices.
+Imported USB devices
+====================
+Port 00: <Port in Use> at High Speed(480Mbps)
+       Microsoft Corp. : Xbox Wireless Controller (045e:02ea)
+       3-1 -> usbip://192.168.1.42:3240/1-1.4
+           -> remote bus/dev 001/002
+Port 01: <Port in Use> at Full Speed(12Mbps)
+       Realtek Semiconductor Corp. : Bluetooth Radio (0bda:c820)
+       3-2 -> usbip://192.168.1.42:3240/1-2
+           -> remote bus/dev 001/003
