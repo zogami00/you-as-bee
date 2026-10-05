@@ -84,7 +84,7 @@ func (b *fakeBinder) Unbind(_ context.Context, dev sysfs.Device, _ usbiphost.Opt
 	}
 	// A released device falls back to the generic USB device driver; the
 	// function driver (here btusb) binds to the interface, not the device.
-	b.src.setDriver(dev.BusID, "us", 0)
+	b.src.setDriver(dev.BusID, "usb", 0)
 	return nil
 }
 
@@ -118,12 +118,12 @@ func (c *fakeClock) set(t time.Time) {
 // --- helpers ---
 
 // btDevice models a real un-exported Bluetooth dongle: the device-level driver
-// is the generic "us", while the function driver btusb is bound to the
-// interface. Treating "us" as a wrong driver used to force a pointless Unbind
+// is the generic "usb", while the function driver btusb is bound to the
+// interface. Treating "usb" as a wrong driver used to force a pointless Unbind
 // and break the first export.
 func btDevice() sysfs.Device {
 	return sysfs.Device{
-		BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "us",
+		BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "usb",
 		Interfaces: []sysfs.Iface{{BusID: "1-1.2:1.0", Driver: "btusb"}},
 	}
 }
@@ -553,10 +553,10 @@ func TestReconcileRetriesFailedUnbind(t *testing.T) {
 }
 
 // TestFirstExportWithGenericDriverDoesNotUnbind: on a real Pi an un-exported
-// device sits on the generic "us" device driver (btusb is bound to the
+// device sits on the generic "usb" device driver (btusb is bound to the
 // interfaces). The first export must go straight to Bind with no prior Unbind.
 func TestFirstExportWithGenericDriverDoesNotUnbind(t *testing.T) {
-	src := newFakeSource(btDevice()) // Driver "us", Status 0
+	src := newFakeSource(btDevice()) // Driver "usb", Status 0
 	binder := &fakeBinder{src: src}
 	r, _ := newTestReconciler(t, src, binder)
 
@@ -564,10 +564,31 @@ func TestFirstExportWithGenericDriverDoesNotUnbind(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 	if binder.unbinds != 0 {
-		t.Errorf("unbinds = %d, want 0: the generic us driver is not a wrong driver", binder.unbinds)
+		t.Errorf("unbinds = %d, want 0: the generic usb driver is not a wrong driver", binder.unbinds)
 	}
 	if binder.binds != 1 {
 		t.Errorf("binds = %d, want 1", binder.binds)
+	}
+	if r.State("bt") != Exported {
+		t.Errorf("state = %s, want exported", r.State("bt"))
+	}
+}
+
+// TestRecoversFromUsbipStatusFailed: usbip_status == 3 is a genuine recovery
+// trigger even when the device-level driver is the generic "usb", so the pass
+// must Unbind before it Binds.
+func TestRecoversFromUsbipStatusFailed(t *testing.T) {
+	dev := btDevice()
+	dev.Status = statusFailed
+	src := newFakeSource(dev)
+	binder := &fakeBinder{src: src}
+	r, _ := newTestReconciler(t, src, binder)
+
+	if err := r.ReconcileOnce(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if binder.unbinds != 1 || binder.binds != 1 {
+		t.Errorf("binds/unbinds = %d/%d, want 1/1 for usbip_status == 3", binder.binds, binder.unbinds)
 	}
 	if r.State("bt") != Exported {
 		t.Errorf("state = %s, want exported", r.State("bt"))
@@ -608,6 +629,55 @@ func TestForceConsumedOnlyWhenUsed(t *testing.T) {
 
 	if !still {
 		t.Error("an action that did not carry force must not consume the pending force")
+	}
+}
+
+// TestForceOnHealthyDeviceDoesNotDisturbLaterAttach: a force issued against a
+// device that is already healthy and exported has no action to run, so it must
+// be cleared. Otherwise it stays pending and a client that attaches normally
+// afterwards is kicked by an unnecessary Unbind+Bind.
+func TestForceOnHealthyDeviceDoesNotDisturbLaterAttach(t *testing.T) {
+	dev := sysfs.Device{BusID: "1-1.2", VID: "0a12", PID: "0001", DevNum: 5, Driver: "usbip-host", Status: 1}
+	src := newFakeSource(dev)
+	binder := &fakeBinder{src: src}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	// Establish the exported generation so the healthy branch is reached.
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	binds, unbinds := binder.binds, binder.unbinds
+
+	// A forced export on an already-healthy device runs no action.
+	if err := r.Export(ctx, "bt", true); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("forced reconcile: %v", err)
+	}
+	if binder.binds != binds || binder.unbinds != unbinds {
+		t.Fatalf("forced pass on a healthy device acted: binds %d->%d, unbinds %d->%d",
+			binds, binder.binds, unbinds, binder.unbinds)
+	}
+	r.mu.Lock()
+	_, still := r.force["bt"]
+	r.mu.Unlock()
+	if still {
+		t.Fatal("force on a healthy device was not cleared")
+	}
+
+	// A client now attaches normally; the stale force must not disturb it.
+	src.setDriver("1-1.2", "usbip-host", 2)
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if binder.binds != binds || binder.unbinds != unbinds {
+		t.Errorf("a normal client attach was disturbed: binds %d->%d, unbinds %d->%d",
+			binds, binder.binds, unbinds, binder.unbinds)
+	}
+	if r.State("bt") != Attached {
+		t.Errorf("state = %s, want attached", r.State("bt"))
 	}
 }
 

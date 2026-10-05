@@ -126,8 +126,8 @@ a later step fails:
    `force` is not set, return `ErrInUse`.
 4. **Disable autosuspend** - write `on` to `power/control`.
 5. **Claim the busid** - write `add <busid>` to `usbip-host/match_busid`.
-6. **Rebind** - unbind the current driver (`btusb`, `xone`, ...) then bind
-   `usbip-host`.
+6. **Rebind** - unbind the current driver when one is bound (`btusb`, `xone`,
+   ...), then bind `usbip-host`.
 7. **Verify** - the driver symlink must be `usbip-host`, `usbip_status` must be
    `1`, and the device generation (`devnum`) must not have changed.
 
@@ -142,11 +142,13 @@ matters when an earlier `Unbind` failed between writes: the device is off
 `usbip-host` and has no driver, so a retry must complete the remaining steps
 instead of treating it as a no-op.
 
-The generic USB device driver `us` is not treated as a wrong driver. On a real
-Pi the device-level `driver` symlink is `us` for every un-exported device (the
+The generic USB device driver `usb` is not treated as a wrong driver. On a real
+Pi the device-level `driver` symlink is `usb` for every un-exported device (the
 function driver such as `btusb` binds to the interfaces), so recovery is only
 triggered by `usbip_status == 3` or by a non-generic driver that is not
-`usbip-host`.
+`usbip-host`. A device with no device-level driver at all has no `driver/unbind`
+to write, so the bind sequence skips that step and proceeds directly to
+`match_busid` + `usbip-host/bind`.
 
 Every sysfs write is performed by the reconcile goroutine. `ReconcileOnce`
 serializes whole passes (so two concurrent callers cannot double-bind) and holds
@@ -156,7 +158,9 @@ responsive while a bind is in flight.
 
 A forced export is consumed only by the pass that actually used it (a pass that
 acts on the pin with `force` set), so a later attach is refused again unless
-forced again.
+forced again. A force issued against a device that is already healthy and
+exported has no action to run and is cleared immediately, so it cannot survive
+to disturb a client that attaches later.
 
 ## Backoff and quarantine
 

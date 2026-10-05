@@ -99,7 +99,7 @@ const (
 )
 
 // newBoundTestFS builds a tree for a Bluetooth dongle currently on the generic
-// "us" device driver (btusb binds to the interface, not the device).
+// "usb" device driver (btusb binds to the interface, not the device).
 func newBoundTestFS() *fakeSysFS {
 	f := newFakeSysFS()
 	f.addFile(testDevDir+"/idVendor", "0a12")
@@ -108,7 +108,7 @@ func newBoundTestFS() *fakeSysFS {
 	f.addFile(testDevDir+"/usbip_status", "0")
 	f.addFile(testPower, "auto")
 	f.addFile(testMatch, "")
-	f.addLink(testDrvLn, testRoot+"/bus/usb/drivers/us")
+	f.addLink(testDrvLn, testRoot+"/bus/usb/drivers/usb")
 	return f
 }
 
@@ -150,6 +150,30 @@ func TestBindSuccessSequence(t *testing.T) {
 		{testPower, "on"},
 		{testMatch, "add " + testBusID},
 		{testUnbnd, testBusID},
+		{testBind, testBusID},
+	})
+}
+
+// TestBindDriverlessDeviceExportsOnFirstAttempt: a device with no device-level
+// driver has no driver/unbind to write, so the bind sequence must skip that
+// step instead of failing with ENOENT and only recovering on a later pass.
+func TestBindDriverlessDeviceExportsOnFirstAttempt(t *testing.T) {
+	f := newBoundTestFS()
+	delete(f.links, testDrvLn) // no device-level driver
+	f.onWrite = func(name, _ string) error {
+		if name == testBind {
+			f.links[testDrvLn] = testRoot + "/bus/usb/drivers/usbip-host"
+			f.files[testDevDir+"/usbip_status"] = "1"
+		}
+		return nil
+	}
+
+	if err := newBinder(f).Bind(context.Background(), testDevice(), Options{}); err != nil {
+		t.Fatalf("Bind for a driverless device: %v", err)
+	}
+	assertWrites(t, f, []writeOp{
+		{testPower, "on"},
+		{testMatch, "add " + testBusID},
 		{testBind, testBusID},
 	})
 }
@@ -347,7 +371,7 @@ func TestUnbindSequence(t *testing.T) {
 // usbip-host (for example after an interrupted Unbind): the remaining steps
 // must still run so it cannot be left driverless.
 func TestUnbindCompletesStepsWhenDriverAbsent(t *testing.T) {
-	f := newBoundTestFS() // on "us", status 0
+	f := newBoundTestFS() // on "usb", status 0
 
 	if err := newBinder(f).Unbind(context.Background(), testDevice(), Options{}); err != nil {
 		t.Fatalf("Unbind: %v", err)

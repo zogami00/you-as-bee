@@ -28,9 +28,9 @@ func buildTree() *FakeFS {
 	f.AddFile(root+"/1-1.2/busnum", "1")
 	f.AddFile(root+"/1-1.2/devnum", "5")
 	f.AddFile(root+"/1-1.2/speed", "12")
-	// On a real Pi the device-level driver is "us"; btusb binds to the
+	// On a real Pi the device-level driver is "usb"; btusb binds to the
 	// interfaces.
-	f.AddLink(root+"/1-1.2/driver", "../../../../bus/usb/drivers/us")
+	f.AddLink(root+"/1-1.2/driver", "../../../../bus/usb/drivers/usb")
 	f.AddLink(root+"/1-1.2/1-1.2:1.0/driver", "../../../../../bus/usb/drivers/btusb")
 	// Second interface deliberately has no driver link.
 	f.AddDir(root + "/1-1.2/1-1.2:1.1")
@@ -88,8 +88,8 @@ func TestEnumerateMissingSerialTolerated(t *testing.T) {
 	if bt.Speed != "12" {
 		t.Errorf("Speed = %q, want 12", bt.Speed)
 	}
-	if bt.Driver != "us" {
-		t.Errorf("Driver = %q, want us (device-level driver on a real Pi)", bt.Driver)
+	if bt.Driver != "usb" {
+		t.Errorf("Driver = %q, want usb (device-level driver on a real Pi)", bt.Driver)
 	}
 	if bt.Product != "Bluetooth Dongle (HCI mode)" {
 		t.Errorf("Product = %q", bt.Product)
@@ -146,7 +146,7 @@ func TestEnumerateSymlinkedDeviceDirectory(t *testing.T) {
 	f.AddFile(target+"/product", "Bluetooth Dongle (HCI mode)")
 	f.AddFile(target+"/devnum", "5")
 	f.AddFile(target+"/usbip_status", "0")
-	f.AddLink(target+"/driver", "/sys/bus/usb/drivers/us")
+	f.AddLink(target+"/driver", "/sys/bus/usb/drivers/usb")
 	f.AddLinkDir(root+"/1-1.2/1-1.2:1.0", target+"/1-1.2:1.0")
 	f.AddFile(target+"/1-1.2:1.0/idVendor", "0A12")
 	f.AddLink(target+"/1-1.2:1.0/driver", "/sys/bus/usb/drivers/btusb")
@@ -162,8 +162,8 @@ func TestEnumerateSymlinkedDeviceDirectory(t *testing.T) {
 	if d.BusID != "1-1.2" || d.VID != "0a12" || d.PID != "0001" {
 		t.Errorf("device = %+v", d)
 	}
-	if d.Driver != "us" {
-		t.Errorf("Driver = %q, want us", d.Driver)
+	if d.Driver != "usb" {
+		t.Errorf("Driver = %q, want usb", d.Driver)
 	}
 	if len(d.Interfaces) != 1 || d.Interfaces[0].Driver != "btusb" {
 		t.Errorf("Interfaces = %+v, want one with driver btusb", d.Interfaces)

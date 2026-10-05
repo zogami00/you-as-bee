@@ -37,7 +37,7 @@ const (
 	maxFailures      = 5
 
 	driverName    = "usbip-host"
-	genericDriver = "us"
+	genericDriver = "usb"
 	statusOK      = 1
 	statusInUse   = 2
 	statusFailed  = 3
@@ -303,6 +303,10 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 
 	if desired {
 		if healthy && rec.gen == dev.DevNum {
+			// The device is already healthy and no action is needed, so a
+			// pending force has nothing to act on. Clear it instead of letting
+			// it survive and disturb a client that attaches later.
+			delete(r.force, pin.Name)
 			if rec.state != Exported {
 				rec.state = Exported
 			}
@@ -319,7 +323,7 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 		// reported, when the device sits on a non-generic wrong driver, or when
 		// a previously exported device is no longer healthy.
 		//
-		// The generic USB device driver "us" is not a wrong driver: on a real
+		// The generic USB device driver "usb" is not a wrong driver: on a real
 		// Pi it is the device-level driver for every un-exported device (the
 		// function driver, e.g. btusb, binds to the interfaces), so treating it
 		// as wrong would force a pointless Unbind and break the first export.

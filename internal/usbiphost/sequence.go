@@ -142,9 +142,14 @@ func (b *Binder) Bind(ctx context.Context, dev sysfs.Device, opts Options) error
 	if err := b.write(b.matchBusid(), "add "+dev.BusID); err != nil {
 		return b.rollback(dev.BusID, savedPower, fmt.Errorf("usbiphost: match_busid add: %w", err))
 	}
-	// Step 6a: release the current driver (btusb/xpad/xone).
-	if err := b.write(b.driverUnbind(dev.BusID), dev.BusID); err != nil {
-		return b.rollback(dev.BusID, savedPower, fmt.Errorf("usbiphost: unbind current driver: %w", err))
+	// Step 6a: release the current driver (btusb/xpad/xone) when one is
+	// present. A device with no device-level driver has no driver/unbind to
+	// write, so treat that step as a no-op and continue rather than failing
+	// with ENOENT and only recovering on the next pass's drivers_probe.
+	if cur.Driver != "" {
+		if err := b.write(b.driverUnbind(dev.BusID), dev.BusID); err != nil {
+			return b.rollback(dev.BusID, savedPower, fmt.Errorf("usbiphost: unbind current driver: %w", err))
+		}
 	}
 	// Step 6b: bind usbip-host.
 	if err := b.write(b.usbipHostBind(), dev.BusID); err != nil {
