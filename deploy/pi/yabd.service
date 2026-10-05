@@ -27,10 +27,11 @@ Group=root
 # directory removes that ordering hazard.
 #
 # ConfigurationDirectory=you-as-bee is deliberately absent. The daemon only
-# *reads* /etc/you-as-bee/agent.json and /etc/you-as-bee/token; the sole writer
-# is `yabd config save` (cmd/yabd/cli.go:saveConfig), which runs outside this
-# unit. ProtectSystem=strict still permits reading /etc, so the token stays
-# reachable without granting write access the daemon never uses.
+# *reads* /etc/you-as-bee/agent.json and /etc/you-as-bee/token; the writers are
+# `yabd pin` and `yabd export --persist` (cmd/yabd/cli.go:saveConfig, reached
+# through cmdPin/setPinMode), which run outside this unit. ProtectSystem=strict
+# still permits reading /etc, so the token stays reachable without granting
+# write access the daemon never uses.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/sys

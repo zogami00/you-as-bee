@@ -43,7 +43,15 @@ NFT_TABLE="yab"
 
 CHANGED=0
 BINARY_CHANGED=0
+CONFIG_CHANGED=0
+UNIT_CHANGED=0
 FIRST_TOKEN=0
+
+# WROTE is set by write_file/install_file to 1 when they actually change the
+# destination and 0 when the bytes already matched. Callers capture it into the
+# flag they care about, so the helpers' own change decision is threaded through
+# instead of being re-derived with a second cmp.
+WROTE=0
 
 log() { printf 'provision: %s\n' "$*"; }
 warn() { printf 'provision: warning: %s\n' "$*" >&2; }
@@ -155,6 +163,7 @@ fi
 # write_file DST MODE  (content on stdin; only writes when it differs)
 write_file() {
 	local dst="$1" mode="$2" tmp
+	WROTE=0
 	tmp="$(mktemp)"
 	cat >"$tmp"
 	if [ -f "$dst" ] && cmp -s "$tmp" "$dst"; then
@@ -164,15 +173,18 @@ write_file() {
 	install -D -m "$mode" "$tmp" "$dst"
 	rm -f "$tmp"
 	CHANGED=1
+	WROTE=1
 }
 
 install_file() {
 	local src="$1" dst="$2" mode="$3"
+	WROTE=0
 	if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
 		return 0
 	fi
 	install -D -m "$mode" "$src" "$dst"
 	CHANGED=1
+	WROTE=1
 }
 
 pkg_installed() { dpkg -s "$1" >/dev/null 2>&1; }
@@ -238,6 +250,7 @@ fi
 
 install_file "$SCRIPT_DIR/usbipd.service" /etc/systemd/system/usbipd.service 0644
 install_file "$SCRIPT_DIR/yabd.service" /etc/systemd/system/yabd.service 0644
+UNIT_CHANGED=$WROTE
 systemctl daemon-reload
 
 # --- token and agent config --------------------------------------------------
@@ -291,6 +304,7 @@ cfg["usbip"]["usbipd_bin"] = usbipd
 print(json.dumps(cfg, indent=2))
 PY
 write_file "$AGENT_JSON" 0644 <"$agent_tmp"
+CONFIG_CHANGED=$WROTE
 rm -f "$agent_tmp"
 if [ "$AGENT_JSON_CREATED" -eq 1 ]; then
 	log "wrote $AGENT_JSON (edit the pinned devices for your dongles)"
@@ -352,7 +366,21 @@ enable_unit usbipd.service
 enable_unit yabd.service
 start_unit usbipd.service
 
-if [ "$BINARY_CHANGED" -eq 1 ] && systemctl is-active --quiet yabd.service 2>/dev/null; then
+# The agent reads its config once at startup: runAgent calls config.Load and
+# then api.New parses allowed_clients into CIDRs, with no reload and no SIGHUP
+# handler. A rewritten agent.json, yabd.service, or binary therefore only takes
+# effect after a restart. Restart only when one of them actually changed and the
+# service is already running, so a second, unchanged run stays a no-op and does
+# not bounce a healthy service.
+#
+# A restart does not drop attached clients. The unit sets no ExecStop or
+# KillSignal, so the default SIGTERM reaches runAgent, whose shutdown path
+# deliberately waits for the reconcile pass in flight and never unbinds. On
+# start the reconciler refuses to disturb a device whose status is in-use unless
+# explicitly forced. usbipd.service, which owns the client-facing 3240 listener,
+# is not restarted.
+if { [ "$BINARY_CHANGED" -eq 1 ] || [ "$CONFIG_CHANGED" -eq 1 ] || [ "$UNIT_CHANGED" -eq 1 ]; } &&
+	systemctl is-active --quiet yabd.service 2>/dev/null; then
 	systemctl restart yabd.service
 	CHANGED=1
 else

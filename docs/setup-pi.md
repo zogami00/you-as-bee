@@ -85,7 +85,9 @@ sudo ./provision.sh --binary ./yabd-linux-arm64 --client-cidr 192.168.1.0/24
    `0600`) and `/etc/you-as-bee/agent.json` derived from the example. It
    **prints the token once**; copy it to the Windows client now.
 6. Applies the nftables rule allowing 3240/3241 only from `allowed_clients`.
-7. Enables and starts `usbipd.service` and `yabd.service`.
+7. Enables and starts `usbipd.service` and `yabd.service`. If the agent
+   binary, `agent.json`, or `yabd.service` changed, an already-active
+   `yabd.service` is restarted so the running daemon picks the change up.
 
 It is idempotent: run it twice and the second run reports `provision: no
 changes`, without reprinting the token.
@@ -100,8 +102,21 @@ sudo ./provision.sh            # or: scripts\deploy-pi.ps1 -HostName ...
 ```
 
 It rewrites `agent.json` to include `127.0.0.0/8` and replaces the nftables
-rule with one that accepts loopback independently. This first run reports
-changes; a second run then reports `provision: no changes`.
+rule with one that accepts loopback independently. The agent reads its config
+once at startup (there is no reload and no SIGHUP handling), so when
+provisioning rewrites `agent.json`, `yabd.service`, or the binary it also
+restarts an active `yabd.service`; the loopback allowlist and the
+`ConfigurationDirectory` removal take effect immediately, without a manual
+restart. This first run reports changes; a second run changes nothing and
+reports `provision: no changes` (and does not bounce the service).
+
+If the service was not running when you re-ran provisioning, it is started
+rather than restarted. If for any reason the new allowlist is not in effect
+afterwards, apply it by hand:
+
+```bash
+sudo systemctl restart yabd
+```
 
 ### Why btusb is blacklisted
 

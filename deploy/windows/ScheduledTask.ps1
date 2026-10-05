@@ -48,30 +48,57 @@ function Invoke-SchTasks {
     }
 }
 
-# Test-SchTasksNotFound reports whether schtasks output is the "no such task"
-# message rather than a real error. schtasks prints (English, case-insensitive)
-# either "ERROR: The system cannot find the file specified." or "ERROR: The
-# specified task name ... does not exist in the system.". Any other non-zero
-# exit is a genuine failure and must not be read as absence.
-function Test-SchTasksNotFound {
+# Get-SchTasksListing runs `schtasks /query /FO CSV /NH` and returns the raw
+# result object, so callers can decide presence from the task-name column of
+# the CSV rather than from schtasks' human-readable "task not found" message,
+# which is localised and therefore unreliable on non-English Windows.
+function Get-SchTasksListing {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    return Invoke-SchTasks /query /FO CSV /NH
+}
+
+# Test-SchTasksTaskListed reports whether TaskName appears in a `schtasks
+# /query /FO CSV /NH` listing. Each CSV row's first field is the task name,
+# quoted and prefixed with a backslash (for example `"\you-as-bee","N/A",
+# "Ready"`); the parser reads that field directly and compares it after
+# stripping the quoting and the leading backslash. Because the decision is made
+# from the listing - not from a localised error string - a missing task is
+# reported the same way on any system language.
+#
+# A non-zero exit from the query itself is a genuine failure (access denied, a
+# broken task database, ...) and throws: it must never be read as "task absent",
+# or a first install on a machine where the task does not exist yet would abort.
+function Test-SchTasksTaskListed {
     [CmdletBinding()]
     [OutputType([bool])]
     param(
-        [Parameter(Mandatory = $false)]
-        [AllowEmptyString()]
-        [string]$Output
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName
     )
 
-    if ([string]::IsNullOrEmpty($Output)) { return $false }
-    $text = $Output.ToLowerInvariant()
-    return ($text -match 'does not exist') -or ($text -match 'cannot find')
+    $result = Get-SchTasksListing
+    if ($result.ExitCode -ne 0) {
+        throw ("schtasks /query /FO CSV /NH failed (exit {0}): {1}" -f $result.ExitCode, $result.Output.Trim())
+    }
+
+    $want = $TaskName.TrimStart('\')
+    foreach ($line in ($result.Output -split '\r?\n')) {
+        if (-not $line.StartsWith('"')) { continue }
+        $close = $line.IndexOf('"', 1)
+        if ($close -lt 1) { continue }
+        $name = $line.Substring(1, $close - 1).TrimStart('\')
+        if ($name -ieq $want) { return $true }
+    }
+    return $false
 }
 
 # Test-YabTaskExists reports whether a Scheduled Task named TaskName exists. It
-# tries the ScheduledTasks module first and falls back to `schtasks /query /TN`
-# when the module throws or reports nothing. A schtasks failure that is not the
-# "no such task" message throws, so a genuine error is never silently read as
-# "task absent".
+# tries the ScheduledTasks module first and falls back to a `schtasks` CSV
+# listing when the module throws or reports nothing. A genuine schtasks query
+# failure throws, so an error is never silently read as "task absent".
 function Test-YabTaskExists {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -88,10 +115,7 @@ function Test-YabTaskExists {
         # The module can fail on a valid task; fall through to schtasks.
     }
 
-    $result = Invoke-SchTasks /query /TN $TaskName
-    if ($result.ExitCode -eq 0) { return $true }
-    if (Test-SchTasksNotFound $result.Output) { return $false }
-    throw ("schtasks /query /TN '{0}' failed (exit {1}): {2}" -f $TaskName, $result.ExitCode, $result.Output.Trim())
+    return (Test-SchTasksTaskListed -TaskName $TaskName)
 }
 
 # Stop-YabTask ends a running Scheduled Task. Best effort; the ScheduledTasks
@@ -110,10 +134,10 @@ function Stop-YabTask {
 }
 
 # Remove-YabTask deletes a Scheduled Task. Returns $true when it was deleted or
-# was already absent, and $false on a genuine delete failure. schtasks reports a
-# missing task with a non-zero exit and a "cannot find"/"does not exist"
-# message, so a non-zero exit is classified from that text rather than assumed
-# to be either success or failure.
+# was already absent, and $false on a genuine delete failure. A non-zero delete
+# exit is not itself "absent": presence is confirmed from the CSV task listing,
+# because schtasks' "task not found" text is localised and cannot be matched on
+# a non-English Windows. A listing query that genuinely fails throws.
 function Remove-YabTask {
     [CmdletBinding()]
     [OutputType([bool])]
@@ -124,14 +148,9 @@ function Remove-YabTask {
 
     $delete = Invoke-SchTasks /Delete /TN $TaskName /F
     if ($delete.ExitCode -eq 0) { return $true }
-    if (Test-SchTasksNotFound $delete.Output) { return $true }
 
-    # Delete failed for some other reason. Confirm with a query: if the task is
-    # really gone now, treat it as a success; otherwise report failure to the
-    # caller rather than claiming it was removed.
-    $query = Invoke-SchTasks /query /TN $TaskName
-    if ($query.ExitCode -ne 0) {
-        if (Test-SchTasksNotFound $query.Output) { return $true }
-    }
+    # Delete failed. If the task is really gone now, treat that as success;
+    # otherwise the delete genuinely failed and the caller must hear about it.
+    if (-not (Test-SchTasksTaskListed -TaskName $TaskName)) { return $true }
     return $false
 }

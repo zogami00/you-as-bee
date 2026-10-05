@@ -7,10 +7,11 @@
     Plain Windows PowerShell 5.1 script, no Pester dependency. Covers B8: when
     Get-ScheduledTask throws (the "task XML contains a value which is incorrectly
     formatted or out of range" bug observed on Windows 11), Test-YabTaskExists
-    must fall back to schtasks /query /TN and report existence correctly. It
-    also covers m4/m5: a schtasks failure that is not the "no such task" message
-    must be surfaced rather than read as absence, and Remove-YabTask must not
-    report success on a genuine delete failure.
+    must fall back to schtasks and report existence from the locale-independent
+    CSV task listing. It also covers a genuine schtasks query failure being
+    surfaced rather than read as absence - which would otherwise abort a first
+    install - and Remove-YabTask not reporting success on a genuine delete
+    failure.
 
     Run:  powershell -NoProfile -ExecutionPolicy Bypass -File .\ScheduledTask.Tests.ps1
     Exit code is 0 when every check passes, 1 otherwise.
@@ -39,32 +40,56 @@ Write-Host 'ScheduledTask.ps1 tests'
 function Get-ScheduledTask { [pscustomobject]@{ TaskName = 'stub' } }
 Assert-True (Test-YabTaskExists 'stub') 'existing task is detected via Get-ScheduledTask'
 
-# 2. The module throws (the observed bug): the schtasks fallback must decide.
+# From here on the module throws (the observed bug): schtasks must decide.
 function Get-ScheduledTask { throw 'The task XML contains a value which is incorrectly formatted or out of range.' }
 
-function schtasks { $global:LASTEXITCODE = 0; return }
-Assert-True (Test-YabTaskExists 'stub') 'fallback reports an existing task when the module throws'
+# 2. Task present: the CSV listing contains the task name.
+function schtasks {
+    $global:LASTEXITCODE = 0
+    Write-Output '"\stub","N/A","Ready"'
+}
+Assert-True (Test-YabTaskExists 'stub') 'fallback reports an existing task from the CSV listing'
 
-# A non-zero exit is only "absent" when schtasks says so.
-function schtasks { $global:LASTEXITCODE = 1; Write-Output 'ERROR: The specified task name "stub" does not exist in the system.' }
-Assert-True (-not (Test-YabTaskExists 'stub')) 'fallback reports a missing task when schtasks says it does not exist'
+# 2b. Task absent: the CSV listing does not contain the task name. The decision
+# does not depend on the language of any error text.
+function schtasks {
+    $global:LASTEXITCODE = 0
+    Write-Output '"\someone-else","N/A","Ready"'
+}
+Assert-True (-not (Test-YabTaskExists 'stub')) 'fallback reports a task absent from the CSV listing as missing'
 
-# Any other failure must not be read as absence.
-function schtasks { $global:LASTEXITCODE = 1; Write-Output 'ERROR: Access is denied.' }
+# 2c. An empty task list still reports the task absent.
+function schtasks {
+    $global:LASTEXITCODE = 0
+    Write-Output 'INFO: There are no scheduled tasks present in the system.'
+}
+Assert-True (-not (Test-YabTaskExists 'stub')) 'fallback reports absent when the system has no tasks'
+
+# 2d. A genuine query failure (unrecognised, localised text) must be surfaced,
+# not read as absence - otherwise a first install would abort even with -Force.
+function schtasks { $global:LASTEXITCODE = 1; Write-Output 'ERROR: Zugriff verweigert.' }
 $threw = $false
 try { [void](Test-YabTaskExists 'stub') } catch { $threw = $true }
-Assert-True $threw 'a genuine schtasks failure is surfaced, not read as absence'
+Assert-True $threw 'a genuine schtasks query failure is surfaced, not read as absence'
 
 # 3. Remove-YabTask: delete succeeded.
 function schtasks { $global:LASTEXITCODE = 0; return }
 Assert-True (Remove-YabTask 'stub') 'Remove-YabTask succeeds when the delete exits zero'
 
-# 4. Remove-YabTask: already absent is success.
-function schtasks { $global:LASTEXITCODE = 1; Write-Output 'ERROR: The system cannot find the file specified.' }
+# 4. Remove-YabTask: the delete failed but the task is gone from the listing.
+function schtasks {
+    if ($args -contains '/Delete') { $global:LASTEXITCODE = 1; Write-Output 'ERROR: ...'; return }
+    $global:LASTEXITCODE = 0
+    Write-Output '"\someone-else","N/A","Ready"'
+}
 Assert-True (Remove-YabTask 'stub') 'Remove-YabTask treats an already-absent task as success'
 
-# 5. Remove-YabTask: a genuine failure is not reported as success.
-function schtasks { $global:LASTEXITCODE = 1; Write-Output 'ERROR: Access is denied.' }
+# 5. Remove-YabTask: the delete failed and the task is still listed.
+function schtasks {
+    if ($args -contains '/Delete') { $global:LASTEXITCODE = 1; Write-Output 'ERROR: ...'; return }
+    $global:LASTEXITCODE = 0
+    Write-Output '"\stub","N/A","Ready"'
+}
 Assert-True (-not (Remove-YabTask 'stub')) 'Remove-YabTask reports failure when the delete genuinely fails'
 
 # 6. Real schtasks, module still throwing: a task that does not exist is absent.
