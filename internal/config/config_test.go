@@ -68,8 +68,34 @@ func TestClientDefaults(t *testing.T) {
 	if cfg.CommandTimeout.Duration() != 15*time.Second {
 		t.Errorf("CommandTimeout = %s, want 15s", cfg.CommandTimeout)
 	}
+	if cfg.ReceiveMode != ReceiveModeLowLatency {
+		t.Errorf("ReceiveMode = %q, want %q", cfg.ReceiveMode, ReceiveModeLowLatency)
+	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
+	}
+}
+
+// B9: receive_mode accepts the two known values and rejects anything else.
+func TestClientReceiveMode(t *testing.T) {
+	for _, mode := range []string{ReceiveModeLowLatency, ReceiveModeZeroCopy} {
+		var cfg ClientConfig
+		body := `{"schema_version":1,"receive_mode":"` + mode + `"}`
+		if err := Load(writeTemp(t, body), &cfg); err != nil {
+			t.Fatalf("Load(%q): %v", mode, err)
+		}
+		if cfg.ReceiveMode != mode {
+			t.Errorf("ReceiveMode = %q, want %q", cfg.ReceiveMode, mode)
+		}
+	}
+
+	var cfg ClientConfig
+	err := Load(writeTemp(t, `{"schema_version":1,"receive_mode":"turbo"}`), &cfg)
+	if err == nil {
+		t.Fatal("expected an unknown receive_mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "receive_mode") {
+		t.Errorf("error %q does not name receive_mode", err)
 	}
 }
 

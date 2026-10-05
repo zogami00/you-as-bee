@@ -6,9 +6,11 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -102,9 +104,20 @@ func newFlagSet(name string) *flag.FlagSet {
 func loadConfig(path string) (config.ClientConfig, error) {
 	var cfg config.ClientConfig
 	if err := config.Load(path, &cfg); err != nil {
-		return config.ClientConfig{}, err
+		return config.ClientConfig{}, configReadError(path, err)
 	}
 	return cfg, nil
+}
+
+// configReadError makes a permission failure actionable. %ProgramData%\you-as-bee
+// is deliberately restricted to Administrators and SYSTEM because client.json
+// holds the bearer token, so an unelevated read fails with a raw "Access is
+// denied"; tell the user how to fix it instead.
+func configReadError(path string, err error) error {
+	if errors.Is(err, fs.ErrPermission) {
+		return fmt.Errorf("cannot read %s; run from an elevated prompt (the config holds the API token)", path)
+	}
+	return err
 }
 
 // locateTool finds usbip.exe for the config, or returns a typed error.
@@ -113,7 +126,9 @@ func locateTool(cfg config.ClientConfig) (*usbipwin.Tool, error) {
 	if err != nil {
 		return nil, err
 	}
-	return usbipwin.New(path, execx.New()), nil
+	tool := usbipwin.New(path, execx.New())
+	tool.ReceiveMode = cfg.ReceiveMode
+	return tool, nil
 }
 
 // newManager builds the supervisor. When tool is nil a no-op USBIP is used so

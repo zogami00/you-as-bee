@@ -15,11 +15,20 @@ RestartSec=2
 ExecStart=/usr/local/bin/yabd run --config /etc/you-as-bee/agent.json
 User=root
 Group=root
-# Hardening. The agent must write sysfs to bind devices and reach the token and
-# state directories, and nothing else.
+# Hardening. The agent must write sysfs to bind devices, read its config and
+# token from /etc, and have a state directory, and nothing else.
+#
+# StateDirectory= and ConfigurationDirectory= make systemd create and own
+# /var/lib/you-as-bee and /etc/you-as-bee before the mount namespace is set up.
+# They must NOT be listed in ReadWritePaths= as well: ReadWritePaths= is applied
+# first and, under ProtectSystem=strict, a path there that does not already
+# exist makes the unit die with 226/NAMESPACE and crash-loop forever. Letting
+# systemd own those directories removes that ordering hazard.
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/sys /etc/you-as-bee /var/lib/you-as-bee
+ReadWritePaths=/sys
+StateDirectory=you-as-bee
+ConfigurationDirectory=you-as-bee
 ProtectHome=yes
 PrivateTmp=yes
 

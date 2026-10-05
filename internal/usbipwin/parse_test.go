@@ -145,6 +145,8 @@ func TestAttachRejectsInvalidBusIDBeforeRunning(t *testing.T) {
 	}
 }
 
+// B7/B9: attach must pass --once (or the driver starts its own endless retry
+// loop) and --receive-mode low-latency (the default when none is set).
 func TestAttachPassesArgumentVector(t *testing.T) {
 	fr := execx.NewFakeRunner()
 	tool := New(`C:\fake\usbip.exe`, fr)
@@ -159,13 +161,76 @@ func TestAttachPassesArgumentVector(t *testing.T) {
 	if got.Name != `C:\fake\usbip.exe` {
 		t.Errorf("name = %q", got.Name)
 	}
-	want := []string{"attach", "-r", "192.168.1.42", "-b", "1-1.4"}
+	want := []string{"attach", "-r", "192.168.1.42", "-b", "1-1.4", "--once", "--receive-mode", "low-latency"}
 	if len(got.Args) != len(want) {
 		t.Fatalf("args = %v, want %v", got.Args, want)
 	}
 	for i := range want {
 		if got.Args[i] != want[i] {
 			t.Fatalf("args = %v, want %v", got.Args, want)
+		}
+	}
+}
+
+// B9: a configured receive mode is passed through verbatim.
+func TestAttachHonoursConfiguredReceiveMode(t *testing.T) {
+	fr := execx.NewFakeRunner()
+	tool := New(`C:\fake\usbip.exe`, fr)
+	tool.ReceiveMode = "zero-copy"
+	if err := tool.Attach(context.Background(), "192.168.1.42", "1-1.4"); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	calls := fr.Calls()
+	if len(calls) != 1 {
+		t.Fatalf("want 1 call, got %d", len(calls))
+	}
+	want := []string{"attach", "-r", "192.168.1.42", "-b", "1-1.4", "--once", "--receive-mode", "zero-copy"}
+	got := calls[0].Args
+	if len(got) != len(want) {
+		t.Fatalf("args = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("args = %v, want %v", got, want)
+		}
+	}
+}
+
+// B7: detach must also stop any lingering automatic attach attempt the driver
+// may have started before --once was added.
+func TestDetachStopsLingeringAttachAttempts(t *testing.T) {
+	fr := execx.NewFakeRunner()
+	tool := New(`C:\fake\usbip.exe`, fr)
+	if err := tool.Detach(context.Background(), 3); err != nil {
+		t.Fatalf("Detach: %v", err)
+	}
+	calls := fr.Calls()
+	if len(calls) != 2 {
+		t.Fatalf("want 2 calls (detach, attach --stop-all), got %d: %+v", len(calls), calls)
+	}
+	assertArgs(t, calls[0].Args, []string{"detach", "-p", "3"})
+	assertArgs(t, calls[1].Args, []string{"attach", "--stop-all"})
+}
+
+func TestDetachRejectsNegativePortBeforeRunning(t *testing.T) {
+	fr := execx.NewFakeRunner()
+	tool := New(`C:\fake\usbip.exe`, fr)
+	if err := tool.Detach(context.Background(), -1); err == nil {
+		t.Fatal("want an error for a negative port")
+	}
+	if fr.CallCount() != 0 {
+		t.Fatalf("runner invoked %d times", fr.CallCount())
+	}
+}
+
+func assertArgs(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("args = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("args = %v, want %v", got, want)
 		}
 	}
 }

@@ -28,6 +28,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Shared task helpers: Test-YabTaskExists falls back to schtasks when
+# Get-ScheduledTask throws (see ScheduledTask.ps1).
+. (Join-Path $PSScriptRoot 'ScheduledTask.ps1')
+
 $DryRun = [bool]$WhatIfPreference
 
 function Write-Step([string]$Message) {
@@ -61,18 +65,19 @@ if ($DryRun -and -not $isAdmin) {
 Write-Step 'logon task'
 
 $taskName = 'you-as-bee-client'
-$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existing) {
+if (Test-YabTaskExists $taskName) {
     # Stop the running instance before deleting: its yab.exe locks the file we
     # are about to remove.
     if (-not $DryRun) {
-        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        [void](Stop-YabTask $taskName)
         Get-Process -Name 'yab' -ErrorAction SilentlyContinue | ForEach-Object {
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
         }
     }
     if ($PSCmdlet.ShouldProcess($taskName, 'Delete Scheduled Task')) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        if (-not (Remove-YabTask $taskName)) {
+            Fail ("failed to delete the scheduled task '{0}'" -f $taskName)
+        }
     }
     Write-Ok 'task removed'
 } else {

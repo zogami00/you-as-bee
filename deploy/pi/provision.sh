@@ -18,6 +18,14 @@
 #
 set -euo pipefail
 
+# The tools below (modprobe, nft) live in /usr/sbin, which is absent from the
+# PATH of a non-login shell such as `ssh host 'bash provision.sh'` or a
+# cloud-init runcmd. Set a sane PATH explicitly rather than inheriting whatever
+# the caller had, so the script does not die with "modprobe not found" or fail
+# later on nft.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 CLIENT_CIDRS=""

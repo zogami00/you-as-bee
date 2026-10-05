@@ -58,6 +58,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Shared task helpers: Test-YabTaskExists falls back to schtasks when
+# Get-ScheduledTask throws (see ScheduledTask.ps1).
+. (Join-Path $PSScriptRoot 'ScheduledTask.ps1')
+
 $DryRun = [bool]$WhatIfPreference
 
 function Write-Step([string]$Message) {
@@ -82,8 +86,8 @@ function Fail([string]$Message) {
 
 # Stop the logon task and the tray process so a locked yab.exe can be replaced.
 function Stop-YabClient {
-    if (Get-ScheduledTask -TaskName 'you-as-bee-client' -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName 'you-as-bee-client' -ErrorAction SilentlyContinue
+    if (Test-YabTaskExists 'you-as-bee-client') {
+        [void](Stop-YabTask 'you-as-bee-client')
     }
     Get-Process -Name 'yab' -ErrorAction SilentlyContinue | ForEach-Object {
         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
@@ -282,9 +286,8 @@ if ($writeConfig) {
 Write-Step 'logon task'
 
 $taskName = 'you-as-bee-client'
-$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 $register = $true
-if ($existing -and -not $Force) {
+if ((Test-YabTaskExists $taskName) -and -not $Force) {
     $register = $false
     Write-Ok 'task already registered (use -Force to re-register)'
 }

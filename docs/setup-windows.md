@@ -76,6 +76,12 @@ cd deploy\windows
 It supports `-WhatIf` (safe without elevation) and is idempotent. If you omit
 `-PiHost`/`-Token`, edit the config afterwards.
 
+`%ProgramData%\you-as-bee` is restricted to Administrators and SYSTEM because
+`client.json` holds the bearer token. Every `yab` command reads that file, so
+run them from an **elevated** prompt; unelevated they fail with
+`yab: cannot read C:\ProgramData\you-as-bee\client.json; run from an elevated
+prompt (the config holds the API token)`.
+
 ## 4. Configuration
 
 See [configuration.md](configuration.md). At minimum set `servers[0].host` and

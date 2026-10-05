@@ -10,6 +10,23 @@ import (
 // DefaultAPIPort is the management API port on the Pi agent.
 const DefaultAPIPort = 3241
 
+// usbip-win2 receive modes. low-latency avoids the zero-copy default, which
+// floods Windows with device-change events against some devices (measured on
+// real hardware: 86 events in 45s under zero-copy vs 5 in 60s under
+// low-latency, with matching USB stall/reset messages in the Pi kernel log).
+const (
+	// ReceiveModeLowLatency is the default: usbip-win2 --receive-mode low-latency.
+	ReceiveModeLowLatency = "low-latency"
+	// ReceiveModeZeroCopy is usbip-win2's own default.
+	ReceiveModeZeroCopy = "zero-copy"
+)
+
+// validReceiveModes are the receive_mode values the client accepts.
+var validReceiveModes = map[string]bool{
+	ReceiveModeLowLatency: true,
+	ReceiveModeZeroCopy:   true,
+}
+
 var tokenRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 // ServerConfig describes one Pi agent the Windows client can talk to.
@@ -44,8 +61,11 @@ type ClientConfig struct {
 	AutoAttach     []AutoAttach    `json:"auto_attach"`
 	Reconnect      ReconnectConfig `json:"reconnect"`
 	CommandTimeout Duration        `json:"command_timeout"`
-	LogFile        string          `json:"log_file"`
-	LogLevel       string          `json:"log_level"`
+	// ReceiveMode selects the usbip-win2 attach receive mode: low-latency
+	// (default) or zero-copy. See the ReceiveMode* constants.
+	ReceiveMode string `json:"receive_mode"`
+	LogFile     string `json:"log_file"`
+	LogLevel    string `json:"log_level"`
 }
 
 func (c *ClientConfig) setDefaults() {
@@ -53,6 +73,7 @@ func (c *ClientConfig) setDefaults() {
 	c.Reconnect.Initial = Duration(1 * time.Second)
 	c.Reconnect.Max = Duration(30 * time.Second)
 	c.CommandTimeout = Duration(15 * time.Second)
+	c.ReceiveMode = ReceiveModeLowLatency
 	c.LogLevel = "info"
 }
 
@@ -121,6 +142,13 @@ func (c *ClientConfig) Validate() error {
 	}
 	if c.CommandTimeout <= 0 {
 		return fmt.Errorf("command_timeout: must be positive")
+	}
+	if c.ReceiveMode == "" {
+		c.ReceiveMode = ReceiveModeLowLatency
+	}
+	if !validReceiveModes[c.ReceiveMode] {
+		return fmt.Errorf("receive_mode: unknown mode %q (want %q or %q)",
+			c.ReceiveMode, ReceiveModeLowLatency, ReceiveModeZeroCopy)
 	}
 	if !validLogLevels[c.LogLevel] {
 		return fmt.Errorf("log_level: unknown level %q", c.LogLevel)

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/proto"
 )
 
@@ -125,6 +126,36 @@ func TestCorrectTokenSucceeds(t *testing.T) {
 	}
 	if len(resp.Devices) != 1 || resp.Devices[0].Pin != "bt" {
 		t.Errorf("devices = %+v", resp.Devices)
+	}
+}
+
+// B2: with the shipped defaults the on-Pi CLI's loopback peer must be allowed,
+// while a public address outside the default allowlist must still be refused.
+// Before the fix DefaultAllowedClients was RFC1918-only, so requests from
+// 127.0.0.1 were rejected with 403 and `yabd status`/`export` could not work.
+func TestDefaultAllowlistAllowsLoopbackAndRejectsPublic(t *testing.T) {
+	backend := &fakeBackend{devices: []proto.Device{
+		{Pin: "bt", BusID: "1-1.2", VID: "0a12", PID: "0001", Present: true},
+	}}
+	srv, err := New(Config{
+		Token:          testToken,
+		AllowedClients: config.DefaultAllowedClients,
+		Backend:        backend,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	rec := request(t, srv, http.MethodGet, "/v1/devices", "127.0.0.1:43210", testToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("loopback status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+
+	for _, addr := range []string{"203.0.113.5:1234", "8.8.8.8:53"} {
+		rec := request(t, srv, http.MethodGet, "/v1/devices", addr, testToken, nil)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("public %s: status = %d, want 403", addr, rec.Code)
+		}
 	}
 }
 

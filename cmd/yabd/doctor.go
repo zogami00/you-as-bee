@@ -39,7 +39,7 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) int {
 	d.check("udev rule installed", fileExists(udevRuleFile), udevRuleFile)
 
 	btDriver := bluetoothDriver("/sys/class/bluetooth/hci0")
-	d.check("onboard Bluetooth on hci_uart", btDriver == "hci_uart",
+	d.check("onboard Bluetooth on hci_uart", onboardBluetoothOnUART(btDriver),
 		fmt.Sprintf("hci0 driver is %q; btusb must be blacklisted only because onboard BT uses UART", btDriver))
 
 	if d.failures > 0 {
@@ -99,4 +99,13 @@ func bluetoothDriver(dir string) string {
 		return ""
 	}
 	return path.Base(target)
+}
+
+// onboardBluetoothOnUART reports whether a driver name is the onboard
+// Bluetooth-over-UART driver. Raspberry Pi OS binds it as hci_uart_bcm, while
+// other kernels use plain hci_uart, so the check is a prefix match. A USB
+// adapter's btusb must never match: the premise is that onboard BT is on UART,
+// which is exactly why blacklisting btusb leaves it working.
+func onboardBluetoothOnUART(driver string) bool {
+	return strings.HasPrefix(driver, "hci_uart")
 }

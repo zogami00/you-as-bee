@@ -23,7 +23,7 @@ The agent config lives at `/etc/you-as-bee/agent.json`; the client config at
 | `schema_version` | int | `1` | Must be `1`. |
 | `listen` | string | `0.0.0.0:3241` | Management API bind address. USB/IP itself is always 3240 and is not configurable. |
 | `token_file` | string | `/etc/you-as-bee/token` | File holding the bearer token (trimmed of surrounding whitespace). |
-| `allowed_clients` | string[] | RFC1918 ranges | CIDR allowlist for the API, checked against the connection's peer address. |
+| `allowed_clients` | string[] | loopback + RFC1918 ranges | CIDR allowlist for the API, checked against the connection's peer address. |
 | `poll_interval` | duration | `5s` | Reconcile period. Must be positive. |
 | `usbip.bin` | string | `/usr/sbin/usbip` | Path to the `usbip` client tool. |
 | `usbip.usbipd_bin` | string | `/usr/sbin/usbipd` | Path to the `usbipd` daemon. `usbipd` runs as its own systemd unit; the agent never starts or stops it. |
@@ -40,6 +40,11 @@ The agent config lives at `/etc/you-as-bee/agent.json`; the client config at
 device matches a pin and no `serial`/`port` narrows it, the device is
 **ambiguous**: it is reported and never guessed.
 
+`127.0.0.0/8` is included in the default `allowed_clients` so the on-Pi CLI
+(`yabd status`, `export`, `unexport`, `reset`) can reach the agent at
+`http://127.0.0.1:3241`. If you replace the list, keep a loopback range or those
+commands get `403 forbidden`.
+
 ## Client (`yab`)
 
 | Field | Type | Default | Meaning |
@@ -55,6 +60,7 @@ device matches a pin and no `serial`/`port` narrows it, the device is
 | `reconnect.initial` | duration | `1s` | First backoff delay. |
 | `reconnect.max` | duration | `30s` | Backoff ceiling; must not be less than `initial`. |
 | `command_timeout` | duration | `15s` | Per-request API timeout. Must be positive. |
+| `receive_mode` | string | `low-latency` | usbip-win2 attach receive mode: `low-latency` or `zero-copy`. `zero-copy` is usbip-win2's own default and can flood Windows with device-change events and USB stalls against some devices; `low-latency` is the default here. |
 | `log_file` | string | unset | When set, the client appends its log (attach failures, external-detach notifications) to this file; when empty, logging is discarded. The tray task runs as `yab.exe tray`, so use an absolute path the account can write. |
 | `log_level` | string | `info` | `debug`, `info`, `warn` or `error`. |
 
@@ -69,6 +75,7 @@ This is `deploy/pi/agent.example.json` (and what `provision.sh` derives
   "listen": "0.0.0.0:3241",
   "token_file": "/etc/you-as-bee/token",
   "allowed_clients": [
+    "127.0.0.0/8",
     "192.168.0.0/16",
     "10.0.0.0/8",
     "172.16.0.0/12"
@@ -131,6 +138,7 @@ the token `provision.sh` printed on the Pi here. It validates as written
   ],
   "reconnect": { "initial": "1s", "max": "30s" },
   "command_timeout": "15s",
+  "receive_mode": "low-latency",
   "log_file": "",
   "log_level": "info"
 }

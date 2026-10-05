@@ -63,8 +63,11 @@ type AgentConfig struct {
 }
 
 // DefaultAllowedClients is the private-address CIDR allowlist used when none is
-// configured.
+// configured. Loopback is included on purpose: the on-Pi CLI (yabd status,
+// export, unexport, reset) talks to the agent at http://127.0.0.1:3241 and its
+// peer address is 127.0.0.1, which none of the RFC1918 ranges cover.
 var DefaultAllowedClients = []string{
+	"127.0.0.0/8",
 	"192.168.0.0/16",
 	"10.0.0.0/8",
 	"172.16.0.0/12",

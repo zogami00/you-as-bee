@@ -19,6 +19,12 @@ const (
 	defaultTimeout = 10 * time.Second
 )
 
+// DefaultReceiveMode is the usbip-win2 value passed to --receive-mode when
+// Tool.ReceiveMode is empty. low-latency avoids the zero-copy default, which on
+// real hardware produced ~23x more Windows device-change events and continuous
+// USB stall/reset messages in the Pi kernel log.
+const DefaultReceiveMode = "low-latency"
+
 // busIDRe is the only bus-id shape usbip-win2 accepts.
 var busIDRe = regexp.MustCompile(`^[0-9]+-[0-9]+(?:\.[0-9]+)*$`)
 
@@ -41,6 +47,9 @@ func validHost(host string) bool {
 type Tool struct {
 	// Path is the path to usbip.exe.
 	Path string
+	// ReceiveMode is the value passed to attach --receive-mode. Empty means
+	// DefaultReceiveMode (low-latency).
+	ReceiveMode string
 	// Runner runs the binary. A nil Runner defaults to execx.ExecRunner{}.
 	Runner execx.Runner
 }
@@ -60,7 +69,12 @@ func (t *Tool) run(ctx context.Context, timeout time.Duration, args ...string) (
 }
 
 // Attach attaches the remote device at host/busid to a local vhci port via
-// `usbip attach -r <host> -b <busid>`.
+// `usbip attach -r <host> -b <busid> --once --receive-mode <mode>`.
+//
+// --once is essential: without it usbip-win2's driver starts its own endless
+// reconnect loop, so a client that is offline or has unplugged the dongle is
+// still hammered with import requests (26 in ~30 min were observed with no
+// usbip process running), each re-enumerating a USB device.
 func (t *Tool) Attach(ctx context.Context, host, busid string) error {
 	if !validHost(host) {
 		return fmt.Errorf("%w: %q", ErrInvalidHost, host)
@@ -68,7 +82,12 @@ func (t *Tool) Attach(ctx context.Context, host, busid string) error {
 	if !busIDRe.MatchString(busid) {
 		return fmt.Errorf("%w: %q", ErrInvalidBusID, busid)
 	}
-	_, stderr, err := t.run(ctx, attachTimeout, "attach", "-r", host, "-b", busid)
+	mode := t.ReceiveMode
+	if mode == "" {
+		mode = DefaultReceiveMode
+	}
+	_, stderr, err := t.run(ctx, attachTimeout,
+		"attach", "-r", host, "-b", busid, "--once", "--receive-mode", mode)
 	if err == nil {
 		return nil
 	}
@@ -79,7 +98,14 @@ func (t *Tool) Attach(ctx context.Context, host, busid string) error {
 	return fmt.Errorf("usbipwin: attach %s on %s: %w", busid, host, err)
 }
 
-// Detach detaches the local vhci port via `usbip detach -p <port>`.
+// Detach detaches the local vhci port via `usbip detach -p <port>`, then clears
+// any automatic attach retry the driver may still be running via
+// `usbip attach --stop-all`.
+//
+// New attaches pass --once, but a retry started by an earlier version lives in
+// the driver, not in a usbip process, so detaching the port is not enough to
+// stop it. --stop-all is best effort: the port is already detached, so its
+// failure must not turn a successful detach into an error.
 func (t *Tool) Detach(ctx context.Context, port int) error {
 	if port < 0 {
 		return fmt.Errorf("usbipwin: invalid port %d", port)
@@ -88,6 +114,7 @@ func (t *Tool) Detach(ctx context.Context, port int) error {
 	if err != nil {
 		return fmt.Errorf("usbipwin: detach port %d: %w: %s", port, err, strings.TrimSpace(stderr))
 	}
+	_, _, _ = t.run(ctx, defaultTimeout, "attach", "--stop-all")
 	return nil
 }
 
