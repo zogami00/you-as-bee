@@ -32,6 +32,9 @@ type LoginPage struct {
 	Code string
 	// Error is a human-readable failure message, empty on the first render.
 	Error string
+	// Local selects the Windows local-server variant: the one-time code is the
+	// credential and there is no token field. The Pi flow leaves it false.
+	Local bool
 }
 
 // StaticHandler serves the embedded asset files (app.css, app.js, ...). Mount

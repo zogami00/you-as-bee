@@ -407,3 +407,48 @@ func TestAgentWebUIDefaultsOffAndCanBeEnabled(t *testing.T) {
 		t.Error("WebUI = false for an explicit true")
 	}
 }
+
+// The client local UI is on by default with a loopback bind address.
+func TestClientWebUIDefaults(t *testing.T) {
+	var cfg ClientConfig
+	if err := Load(writeTemp(t, `{}`), &cfg); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.WebUI.Enabled {
+		t.Error("WebUI.Enabled default = false, want true (on by default)")
+	}
+	if cfg.WebUI.Listen != DefaultWebUIListen {
+		t.Errorf("WebUI.Listen = %q, want %q", cfg.WebUI.Listen, DefaultWebUIListen)
+	}
+}
+
+func TestClientWebUIExplicitValues(t *testing.T) {
+	body := `{"schema_version":1,"web_ui":{"enabled":false,"listen":"127.0.0.1:8080"}}`
+	var cfg ClientConfig
+	if err := Load(writeTemp(t, body), &cfg); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.WebUI.Enabled {
+		t.Error("WebUI.Enabled = true for an explicit false")
+	}
+	if cfg.WebUI.Listen != "127.0.0.1:8080" {
+		t.Errorf("WebUI.Listen = %q, want 127.0.0.1:8080", cfg.WebUI.Listen)
+	}
+}
+
+// A local UI bind address that is not loopback must be rejected, so a
+// misconfiguration cannot expose the UI beyond the machine.
+func TestClientWebUIRejectsNonLoopbackListen(t *testing.T) {
+	for _, listen := range []string{"0.0.0.0:0", "192.168.1.5:3242", "localhost:0", ":0", "127.0.0.1"} {
+		body := `{"schema_version":1,"web_ui":{"listen":"` + listen + `"}}`
+		var cfg ClientConfig
+		err := Load(writeTemp(t, body), &cfg)
+		if err == nil {
+			t.Errorf("Load(web_ui.listen=%q) succeeded, want a loopback error", listen)
+			continue
+		}
+		if !strings.Contains(err.Error(), "web_ui.listen") {
+			t.Errorf("error %q does not name web_ui.listen", err)
+		}
+	}
+}

@@ -63,6 +63,34 @@ address**, so one client cannot lock the operator out. An open `/v1/events`
 stream is closed as soon as its session ends. With `web_ui: false` every `/ui/`
 path is `404` for an allowlisted peer and `403` for a non-allowlisted one.
 
+### Windows local UI (`/ui/api/`)
+
+`yab tray` serves the same shell from a loopback-only server. It is not part of
+the Pi API: it is reachable only from `127.0.0.1` and authenticates the browser
+with a tray-issued one-time code rather than the Pi token. The code is
+single-use, expires after 60 seconds, and is bound to the browser that loaded
+the issuing GET; redemption sets a local session cookie (`HttpOnly;
+SameSite=Strict`) and `303`-redirects so the code leaves the URL. Non-GET
+requests need `X-YAB-CSRF: 1`. The Host header must match the bound
+`127.0.0.1:<port>` (port `0` means the OS picks one), which blocks DNS
+rebinding.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/ui/login?code=...` | Bind the one-time code to this browser and render the confirm page. |
+| POST | `/ui/login` | Redeem the bound code; set the session cookie; `303` to `/ui/`. Body capped at 4 KiB. |
+| POST | `/ui/logout` | Delete the session; requires `X-YAB-CSRF: 1`. |
+| GET | `/ui/` | The application shell (`mode "client"`). Redirects to `/ui/login` without a session. |
+| GET | `/ui/assets/{file}` | Embedded CSS and JavaScript. |
+| GET | `/ui/api/state` | `{"pins":[...],"servers":[...]}`. `pins` carries `pin`, `server`, `state`, `busid`, `port`, `paused`, `pause_reason`, `last_error`; `servers` carries `name`, `host`, `api_port`, `reachable`, `token_valid`, `device_count`, `error`. |
+| POST | `/ui/api/pins/{server}/{device}/attach` | Resume/attach the pin. |
+| POST | `/ui/api/pins/{server}/{device}/detach` | Pause/detach the pin (does not unexport on the Pi). |
+| GET | `/ui/api/events` | SSE. Sends one `state` event whenever the pin snapshot changes, plus a keepalive comment every 20 seconds. |
+| GET | `/ui/api/logs` | Recent client log records (`?after=<seq>&limit=<1..500>`), the same shape as `/v1/logs`. |
+
+The browser never receives a Pi token or any server credential: the local
+server holds it and enacts attach/detach in-process on the browser's behalf.
+
 ## Routes
 
 | Method | Path | Description |

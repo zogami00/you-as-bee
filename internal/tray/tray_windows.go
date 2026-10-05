@@ -27,6 +27,20 @@ func onReady(ctx context.Context, c Controller) {
 	status.Disable()
 	systray.AddSeparator()
 
+	openUI := systray.AddMenuItem("Open web UI", "")
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-openUI.ClickedCh:
+				if err := c.OpenUI(); err != nil {
+					status.SetTitle("web UI: " + err.Error())
+				}
+			}
+		}
+	}()
+
 	pins := make([]string, 0, len(c.Devices()))
 	toggles := make([]*systray.MenuItem, 0)
 	lines := make([]*systray.MenuItem, 0)

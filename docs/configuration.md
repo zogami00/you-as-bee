@@ -65,8 +65,10 @@ restrictive CIDR. If you edit `agent.json` by hand instead of re-running
 | `reconnect.max` | duration | `30s` | Backoff ceiling; must not be less than `initial`. |
 | `command_timeout` | duration | `15s` | Per-request API timeout. Must be positive. |
 | `receive_mode` | string | `low-latency` | usbip-win2 attach receive mode: `low-latency` or `zero-copy`. `zero-copy` is usbip-win2's own default and can flood Windows with device-change events and USB stalls against some devices; `low-latency` is the default here. Requires **usbip-win2 >= 0.9.8.0**: the `--receive-mode` flag does not exist in v0.9.7.7 or earlier, where attach fails with `usbipwin: usbip exited N`. |
-| `log_file` | string | unset | When set, the client appends its log (attach failures, external-detach notifications) to this file; when empty, logging is discarded. The tray task runs as `yab.exe tray`, so use an absolute path the account can write. |
+| `log_file` | string | unset | When set, the client appends its log (attach failures, external-detach notifications) to this file; when empty, records are still kept in the in-memory ring served by the local UI. The tray task runs as `yab.exe tray`, so use an absolute path the account can write. |
 | `log_level` | string | `info` | `debug`, `info`, `warn` or `error`. |
+| `web_ui.enabled` | bool | `true` | Serve the embedded local browser UI from `yab tray`. Set to `false` to disable the local server entirely. |
+| `web_ui.listen` | string | `127.0.0.1:0` | Loopback bind address of the local UI. The host must be a loopback IP; `0.0.0.0`, a LAN address and a host name are rejected. Port `0` asks the OS for a free port and the tray uses the port it actually bound. |
 
 ## Full agent example
 
@@ -157,9 +159,27 @@ the token `provision.sh` printed on the Pi here. It validates as written
   "command_timeout": "15s",
   "receive_mode": "low-latency",
   "log_file": "",
-  "log_level": "info"
+  "log_level": "info",
+  "web_ui": {
+    "enabled": true,
+    "listen": "127.0.0.1:0"
+  }
 }
 ```
 
 `auto_attach[].device` is the **pin name** from the agent config, not the USB
 bus id. The bus id changes across re-plugs; the pin is stable.
+
+`web_ui` is on by default and the tray always exposes the local browser UI;
+`web_ui.enabled: false` turns it off. The UI binds loopback only, so it is
+reachable from this machine and nowhere else. See
+[setup-windows.md](setup-windows.md) for how to open it.
+
+- **Upgrade ordering.** Like the agent config, the loader rejects unknown
+  fields. A `yab` older than the one that introduced `web_ui` will reject a
+  config containing the key and fail to start. The shipped
+  `deploy/windows/client.example.json` carries `web_ui`, so if you roll the
+  binary back past this version, delete the `"web_ui"` block from
+  `%ProgramData%\you-as-bee\client.json` first (strict JSON: it cannot be
+  commented out). Because the new `yab` enables the UI by default, omitting the
+  key does not disable it.

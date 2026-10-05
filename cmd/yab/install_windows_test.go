@@ -75,9 +75,12 @@ func TestNewLoggerHonoursLogFile(t *testing.T) {
 	// The logger keeps the file open for the process lifetime (as the tray
 	// does), so a t.TempDir cleanup would fail on the still-open handle.
 	path := filepath.Join(dir, "yab.log")
-	lg, err := newLogger(config.ClientConfig{LogFile: path, LogLevel: "warn"})
+	lg, ring, err := newLogger(config.ClientConfig{LogFile: path, LogLevel: "warn"})
 	if err != nil {
 		t.Fatalf("newLogger: %v", err)
+	}
+	if ring == nil {
+		t.Fatal("newLogger returned a nil log ring")
 	}
 	lg.Warn("attach failed", "pin", "pi/xbox")
 
@@ -91,12 +94,21 @@ func TestNewLoggerHonoursLogFile(t *testing.T) {
 }
 
 func TestNewLoggerDiscardsWhenUnset(t *testing.T) {
-	lg, err := newLogger(config.ClientConfig{})
+	lg, ring, err := newLogger(config.ClientConfig{})
 	if err != nil {
 		t.Fatalf("newLogger: %v", err)
 	}
 	if lg == nil {
 		t.Fatal("want a non-nil logger")
+	}
+	if ring == nil {
+		t.Fatal("want a non-nil log ring")
+	}
+	// With log_file empty the ring still captures records, so /ui/api/logs has
+	// something to serve.
+	lg.Info("served from the ring")
+	if got := ring.Entries(0, 1); len(got.Entries) != 1 || got.Entries[0].Msg != "served from the ring" {
+		t.Fatalf("ring entries = %+v, want the info record", got.Entries)
 	}
 }
 

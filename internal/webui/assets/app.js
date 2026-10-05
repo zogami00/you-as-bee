@@ -66,18 +66,27 @@
       },
       events: function () { return new EventSource(url("/events")); }
     },
-    // The Windows client will expose its own surface in a later milestone; the
-    // shell only needs the adapter to exist so the shared assets are complete.
+    // The Windows local server exposes one state document and attach/detach
+    // actions. It never sends a Pi token; the browser authenticates with the
+    // local session cookie.
     client: {
-      info: function () { return Promise.resolve({}); },
-      devices: function () { return Promise.resolve([]); },
-      logs: function () { return Promise.resolve({ entries: [], next: 0 }); },
-      exportDevice: function () { return Promise.resolve({}); },
-      unexportDevice: function () { return Promise.resolve({}); },
-      resetDevice: function () { return Promise.resolve({}); },
-      events: function () { return null; }
+      state: function () { return get("/state"); },
+      logs: function (after, limit) {
+        return get("/logs?after=" + encodeURIComponent(after) + "&limit=" + encodeURIComponent(limit));
+      },
+      attach: function (pin) { return post("/pins/" + pinPath(pin) + "/attach"); },
+      detach: function (pin) { return post("/pins/" + pinPath(pin) + "/detach"); },
+      events: function () { return new EventSource(url("/events")); }
     }
   };
+
+  // pinPath renders a qualified "server/device" pin as two encoded path
+  // segments, matching /ui/api/pins/{server}/{device}/{action}.
+  function pinPath(pin) {
+    var i = String(pin).indexOf("/");
+    if (i < 0) { return encodeURIComponent(pin) + "/" + encodeURIComponent(pin); }
+    return encodeURIComponent(pin.slice(0, i)) + "/" + encodeURIComponent(pin.slice(i + 1));
+  }
 
   var api = adapters[MODE] || adapters.agent;
 
@@ -203,13 +212,100 @@
     host.scrollTop = host.scrollHeight;
   }
 
+  // renderClient draws the Windows local-server state: a server reachability
+  // panel and the pin list with Attach/Detach actions. Every value is written
+  // with textContent, so server data cannot inject markup.
+  function renderClient(state) {
+    state = state || {};
+    renderClientServers(state.servers || []);
+    renderClientPins(state.pins || []);
+  }
+
+  function renderClientServers(servers) {
+    var title = document.getElementById("info-title");
+    if (title) { title.textContent = "Servers"; }
+    var host = document.getElementById("info");
+    host.textContent = "";
+    if (!servers.length) {
+      host.appendChild(text("p", "No configured servers."));
+      return;
+    }
+    servers.forEach(function (s) {
+      var card = document.createElement("div");
+      card.className = "device";
+      var head = document.createElement("div");
+      head.className = "device-head";
+      head.appendChild(text("strong", s.name));
+      head.appendChild(text("span", (s.host || "") + ":" + (s.api_port || 0)));
+      head.appendChild(badge(s.reachable ? (s.token_valid ? "exported" : "error") : "absent"));
+      card.appendChild(head);
+      card.appendChild(definitionList([
+        ["reachable", s.reachable ? "yes" : "no"],
+        ["token", s.token_valid ? "valid" : "invalid"],
+        ["devices", s.device_count],
+        ["error", s.error]
+      ]));
+      host.appendChild(card);
+    });
+  }
+
+  function renderClientPins(pins) {
+    var host = document.getElementById("devices");
+    host.textContent = "";
+    if (!pins.length) {
+      host.appendChild(text("p", "No configured devices."));
+      return;
+    }
+    pins.forEach(function (p) {
+      var card = document.createElement("div");
+      card.className = "device";
+
+      var head = document.createElement("div");
+      head.className = "device-head";
+      head.appendChild(text("strong", p.pin));
+      head.appendChild(badge(p.state));
+
+      var actions = document.createElement("div");
+      actions.className = "device-actions";
+      if (p.paused) {
+        actions.appendChild(actionButton("Attach", function () { return api.attach(p.pin); }));
+      } else {
+        actions.appendChild(actionButton("Detach", function () { return api.detach(p.pin); }));
+      }
+      head.appendChild(actions);
+      card.appendChild(head);
+
+      card.appendChild(definitionList([
+        ["server", p.server],
+        ["busid", p.busid],
+        ["port", p.port >= 0 ? String(p.port) : ""],
+        ["paused", p.paused ? "yes" : "no"],
+        ["pause reason", p.pause_reason],
+        ["last error", p.last_error]
+      ]));
+      host.appendChild(card);
+    });
+  }
+
   // --- wiring -------------------------------------------------------------
 
   function refresh() {
-    return Promise.all([api.info(), api.devices()])
-      .then(function (results) {
-        renderInfo(results[0] || {});
-        renderDevices(results[1] || []);
+    var load;
+    if (MODE === "client") {
+      load = api.state().then(function (state) { return { client: state || {} }; });
+    } else {
+      load = Promise.all([api.info(), api.devices()]).then(function (results) {
+        return { info: results[0] || {}, devices: results[1] || [] };
+      });
+    }
+    return load
+      .then(function (data) {
+        if (MODE === "client") {
+          renderClient(data.client);
+        } else {
+          renderInfo(data.info);
+          renderDevices(data.devices);
+        }
         setConnection("ok", "connected");
       })
       .catch(function () { setConnection("error", "offline"); });
@@ -231,6 +327,15 @@
   function subscribe() {
     var stream = api.events();
     if (!stream) { return; }
+    if (MODE === "client") {
+      // The local server emits a "state" event only when the pin snapshot
+      // changes. Refreshing on open closes the gap between the first render
+      // and the stream connecting.
+      stream.addEventListener("state", refresh);
+      stream.onopen = function () { setConnection("ok", "live"); refresh(); };
+      stream.onerror = function () { setConnection("warn", "reconnecting"); };
+      return;
+    }
     stream.addEventListener("device_added", refresh);
     stream.addEventListener("device_removed", refresh);
     stream.addEventListener("state_changed", refresh);

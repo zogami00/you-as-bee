@@ -202,14 +202,26 @@ func (s *Sessions) evictLocked(now time.Time) {
 // in issue order and expired or redeemed entries are dropped from the front of
 // that order as needed, so a flood of GETs cannot grow the table or make each
 // issue scan the whole map.
+//
+// A code may also be bound to a browser (see Bind): the Windows local server
+// sets an HttpOnly cookie on the GET that carries the code and then requires
+// that same cookie on redemption, so a code copied out of the URL cannot be
+// redeemed by a different client.
 type OneTimeCodes struct {
 	ttl time.Duration
 	max int
 	now func() time.Time
 
 	mu    sync.Mutex
-	m     map[string]time.Time
+	m     map[string]codeEntry
 	order []string
+}
+
+// codeEntry is one live code: when it expires and, once bound, the opaque
+// browser cookie value that must accompany redemption.
+type codeEntry struct {
+	expiry  time.Time
+	binding string
 }
 
 // NewOneTimeCodes returns a code store with the default TTL and cap.
@@ -218,7 +230,7 @@ func NewOneTimeCodes() *OneTimeCodes {
 		ttl: OneTimeCodeTTL,
 		max: maxOneTimeCodes,
 		now: time.Now,
-		m:   make(map[string]time.Time),
+		m:   make(map[string]codeEntry),
 	}
 }
 
@@ -238,9 +250,52 @@ func (c *OneTimeCodes) Issue() string {
 	if len(c.order) >= 2*c.max {
 		c.compactLocked()
 	}
-	c.m[code] = now.Add(c.ttl)
+	c.m[code] = codeEntry{expiry: now.Add(c.ttl)}
 	c.order = append(c.order, code)
 	return code
+}
+
+// Bind attaches binding to a live code and reports whether it is now bound to
+// that binding. It returns true when the code was unbound (and is now bound),
+// and also when it was already bound to the same value, so a browser reload of
+// the issuing page is idempotent. It returns false for an unknown or expired
+// code, or one already bound to a different browser.
+func (c *OneTimeCodes) Bind(code, binding string) bool {
+	if code == "" || binding == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	ent, ok := c.m[code]
+	if !ok || !now.Before(ent.expiry) {
+		return false
+	}
+	if ent.binding == "" {
+		ent.binding = binding
+		c.m[code] = ent
+		return true
+	}
+	return ent.binding == binding
+}
+
+// RedeemBound consumes code only when it is live and was bound to binding by
+// Bind. It returns true only the first time such a code is presented. An
+// unknown, expired, unbound or differently bound code returns false and is left
+// untouched, so the browser that owns the binding can still redeem it.
+func (c *OneTimeCodes) RedeemBound(code, binding string) bool {
+	if code == "" || binding == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	ent, ok := c.m[code]
+	if !ok || ent.binding == "" || ent.binding != binding {
+		return false
+	}
+	delete(c.m, code)
+	return now.Before(ent.expiry)
 }
 
 // Redeem consumes code. It returns true only the first time a code is
@@ -252,12 +307,12 @@ func (c *OneTimeCodes) Redeem(code string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.now()
-	expiry, ok := c.m[code]
+	ent, ok := c.m[code]
 	if !ok {
 		return false
 	}
 	delete(c.m, code)
-	return now.Before(expiry)
+	return now.Before(ent.expiry)
 }
 
 // Len reports the number of live codes (for tests and diagnostics).
@@ -275,8 +330,8 @@ func (c *OneTimeCodes) Len() int {
 func (c *OneTimeCodes) dropStaleFrontLocked(now time.Time) {
 	for len(c.order) > 0 {
 		code := c.order[0]
-		expiry, live := c.m[code]
-		if live && now.Before(expiry) {
+		ent, live := c.m[code]
+		if live && now.Before(ent.expiry) {
 			return
 		}
 		c.order = c.order[1:]

@@ -26,5 +26,9 @@
   "command_timeout": "15s",
   "receive_mode": "low-latency",
   "log_file": "",
-  "log_level": "info"
+  "log_level": "info",
+  "web_ui": {
+    "enabled": true,
+    "listen": "127.0.0.1:0"
+  }
 }

@@ -2,7 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,6 +55,21 @@ type ReconnectConfig struct {
 	Max     Duration `json:"max"`
 }
 
+// DefaultWebUIListen is the default bind address of the Windows local web UI.
+// Port 0 asks the OS for a free port.
+const DefaultWebUIListen = "127.0.0.1:0"
+
+// WebUIConfig configures the Windows local browser UI served by `yab tray`.
+type WebUIConfig struct {
+	// Enabled serves the local UI. It is on by default; set it to false to
+	// disable the local server entirely.
+	Enabled bool `json:"enabled"`
+	// Listen is the loopback bind address. It must be a loopback IP (for
+	// example 127.0.0.1:0, where 0 asks the OS for a free port). A wildcard
+	// (0.0.0.0), a LAN address or a host name is rejected.
+	Listen string `json:"listen"`
+}
+
 // ClientConfig is the configuration for the Windows client (yab).
 type ClientConfig struct {
 	SchemaVersion  int             `json:"schema_version"`
@@ -66,6 +83,8 @@ type ClientConfig struct {
 	ReceiveMode string `json:"receive_mode"`
 	LogFile     string `json:"log_file"`
 	LogLevel    string `json:"log_level"`
+	// WebUI configures the local Windows browser UI. It is enabled by default.
+	WebUI WebUIConfig `json:"web_ui"`
 }
 
 func (c *ClientConfig) setDefaults() {
@@ -75,6 +94,10 @@ func (c *ClientConfig) setDefaults() {
 	c.CommandTimeout = Duration(15 * time.Second)
 	c.ReceiveMode = ReceiveModeLowLatency
 	c.LogLevel = "info"
+	// The local UI is on by default; an explicit "web_ui": {"enabled": false}
+	// still wins because defaults are applied before the document is decoded.
+	c.WebUI.Enabled = true
+	c.WebUI.Listen = DefaultWebUIListen
 }
 
 // Validate checks the client configuration and fills per-server defaults.
@@ -154,5 +177,31 @@ func (c *ClientConfig) Validate() error {
 		return fmt.Errorf("log_level: unknown level %q", c.LogLevel)
 	}
 
+	if strings.TrimSpace(c.WebUI.Listen) == "" {
+		c.WebUI.Listen = DefaultWebUIListen
+	}
+	if err := validateWebUIListen(c.WebUI.Listen); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateWebUIListen requires the local UI to bind a loopback IP. A wildcard,
+// a LAN address or a host name is rejected here as well as at the server, so a
+// misconfiguration cannot expose the UI beyond the machine.
+func validateWebUIListen(listen string) error {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("web_ui.listen: %q must be host:port: %w", listen, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("web_ui.listen: %q must bind a loopback IP such as %s", listen, DefaultWebUIListen)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("web_ui.listen: %q has an invalid port", listen)
+	}
 	return nil
 }
