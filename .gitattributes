@@ -1,6 +1,19 @@
-* text=auto
+# Normalise text files to LF in the working tree.
+#
+# LF is required on the Linux side (CRLF breaks bash and the systemd/udev
+# parsers) and by gofmt, which reports CRLF Go files as unformatted and would
+# therefore fail the scripts/check.ps1 gate on a fresh Windows checkout.
+* text=auto eol=lf
+
+# Windows PowerShell scripts MUST be CRLF for Windows PowerShell 5.1.
+*.ps1 text eol=crlf
+
+# Linux-side scripts and units: explicitly LF.
 *.sh text eol=lf
 *.service text eol=lf
 *.rules text eol=lf
-*.ps1 text eol=crlf
-*.sh text eol=lf
+
+# Keep any accidentally-added binaries untouched.
+*.exe binary
+*.dll binary
+*.so binary
