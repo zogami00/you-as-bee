@@ -28,6 +28,9 @@ func New() *ExecRunner { return &ExecRunner{} }
 // is taken from ctx via exec.CommandContext.
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// On Windows this suppresses a console window for console children
+	// (usbip.exe) started from the windowless yabw.exe; it is nil elsewhere.
+	cmd.SysProcAttr = childSysProcAttr()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -82,6 +82,29 @@ current `yab` always attaches with `--once` it starts no retries of its own, so
 in normal operation the call is a no-op; the side effect only bites when another
 usbip-win2 user or an older `yab` left a retry running.
 
+## Why the tray is a separate windowless build
+
+The Windows client ships as two files built from the same `cmd/yab` package.
+`yab.exe` is an ordinary console binary: running `yab list`, `yab status` or
+`yab doctor` must print to the prompt, and the tool is used interactively. The
+tray, however, is started by a logon Scheduled Task with no one watching the
+console. A console binary started that way flashes a black window and dies with
+it, so the tray is built a second time with `-H windowsgui` as `yabw.exe`. Go's
+linker switches the PE subsystem from console (3) to GUI (2), which tells
+Windows not to allocate a console. It is the identical main package - no code
+is duplicated and there is no wrapper process - so the only difference between
+the two binaries is the subsystem field in the PE header. The installer
+registers the logon task against `yabw.exe tray` and keeps `yab.exe` for the
+CLI.
+
+Because `yabw.exe` has no console of its own, the command runner
+(`internal/execx`) starts every console child - `usbip.exe` - with a Windows
+`SysProcAttr` of `HideWindow` plus `CREATE_NO_WINDOW`, so a console child does
+not allocate a window. Without it the tray would flash a console on every
+reconcile tick (5 s) and on each attach/detach, defeating the windowless build.
+The attribute is a `//go:build windows` file; the non-Windows counterpart
+returns `nil`, so the agent builds and runs unchanged on Linux.
+
 ## Windows local web UI
 
 `yab tray` can serve the same embedded shell (`internal/webui/assets`) from a
@@ -97,6 +120,13 @@ not a second supervisor:
   the browser that loaded it; redeeming it (a `303`) sets an
   `HttpOnly; SameSite=Strict` session cookie and leaves the code out of the URL.
   Session writes require `X-YAB-CSRF: 1`.
+- The code travels as a **path segment** (`GET /ui/login/<code>`), never a query
+  string. `explorer.exe` treats a URL containing `?` as a filesystem path and
+  opens a folder instead of the browser, which would break the de-elevated
+  launch, so `NewLoginURL` has a test asserting the URL stays query-free. The
+  URL is handed to `explorer.exe`; its **exit status is not meaningful** (it
+  exits 1 even on a successful hand-off on Windows 11), so it is not inspected
+  and there is no fallback launcher.
 - **The browser never sees a Pi token.** The local server's payload types carry
   no credential; `Attach`/`Detach` are forwarded in-process to the same
   supervisor methods the tray menu calls, so the loopback server talks to the Pi

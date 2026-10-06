@@ -34,7 +34,7 @@ func argContains(args []string, want string) bool {
 // Windows killing it after 72 hours or refusing to start it on battery.
 func TestRegisterTaskUsesScheduledTaskSettings(t *testing.T) {
 	fr := execx.NewFakeRunner()
-	if err := registerTask(context.Background(), fr, `C:\Program Files\you-as-bee\yab.exe`); err != nil {
+	if err := registerTask(context.Background(), fr, `C:\Program Files\you-as-bee\yabw.exe`); err != nil {
 		t.Fatalf("registerTask: %v", err)
 	}
 	calls := fr.Calls()
@@ -58,7 +58,7 @@ func TestRegisterTaskUsesScheduledTaskSettings(t *testing.T) {
 		"-StartWhenAvailable",
 		"-RunLevel Highest",
 		"-Argument 'tray'",
-		"'C:\\Program Files\\you-as-bee\\yab.exe'",
+		"'C:\\Program Files\\you-as-bee\\yabw.exe'",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("task script missing %q:\n%s", want, joined)
@@ -122,20 +122,53 @@ func TestStopClientEndsTaskAndExcludesSelf(t *testing.T) {
 	fr := execx.NewFakeRunner()
 	stopClient(context.Background(), fr)
 
-	var sawEnd, sawKill bool
+	var sawEnd bool
+	killed := map[string]bool{}
 	for _, c := range fr.Calls() {
 		if c.Name == "schtasks" && argContains(c.Args, "/End") {
 			sawEnd = true
 		}
 		if c.Name == "taskkill" {
-			sawKill = true
+			// The image name is the argument after /IM.
+			for i, a := range c.Args {
+				if a == "/IM" && i+1 < len(c.Args) {
+					killed[c.Args[i+1]] = true
+				}
+			}
 			if !argContains(c.Args, fmt.Sprintf("PID ne %d", os.Getpid())) {
 				t.Errorf("taskkill must exclude this process: %v", c.Args)
 			}
 		}
 	}
-	if !sawEnd || !sawKill {
-		t.Fatalf("calls = %+v, want schtasks /End and taskkill", fr.Calls())
+	if !sawEnd || !killed["yab.exe"] || !killed["yabw.exe"] {
+		t.Fatalf("calls = %+v, want schtasks /End and taskkill for yab.exe and yabw.exe", fr.Calls())
+	}
+}
+
+// windowlessSource must refuse to install when yabw.exe is missing (which would
+// otherwise register a logon task that opens a console window) and name the
+// missing file.
+func TestWindowlessSourceRequiresYabw(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "yab.exe")
+	if err := os.WriteFile(exe, []byte("MZ"), 0o644); err != nil {
+		t.Fatalf("write yab.exe: %v", err)
+	}
+
+	if _, err := windowlessSource(exe); err == nil || !strings.Contains(err.Error(), "yabw.exe") {
+		t.Fatalf("err = %v, want a missing yabw.exe error naming the file", err)
+	}
+
+	want := filepath.Join(dir, "yabw.exe")
+	if err := os.WriteFile(want, []byte("MZ"), 0o644); err != nil {
+		t.Fatalf("write yabw.exe: %v", err)
+	}
+	got, err := windowlessSource(exe)
+	if err != nil {
+		t.Fatalf("windowlessSource: %v", err)
+	}
+	if got != want {
+		t.Fatalf("windowlessSource = %q, want %q", got, want)
 	}
 }
 

@@ -18,6 +18,43 @@ real local USB devices and can use controllers connected through the Pi.
 3. Run the [hardware validation checklist](docs/hardware-validation.md) - the
    items the code cannot prove on its own.
 
+## Install
+
+**Pi.** From the released bundle in one line (the repository is public, so no
+token is needed; see [setup-pi.md](docs/setup-pi.md)):
+
+```bash
+curl -fsSL https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
+  | sudo bash -s -- --release v1.0.0
+```
+
+Omit `--release v1.0.0` to install the newest release (resolved without a
+token). Or from a checkout: `scripts\deploy-pi.ps1` over SSH, or copy
+`deploy/pi` and run `sudo ./provision.sh`.
+
+**Windows.** From an elevated PowerShell, with both `yab.exe` and `yabw.exe`
+next to the script (a packaged bundle) or built into `dist\`:
+
+```powershell
+cd deploy\windows
+.\install.ps1 -PiHost raspberrypi.local -Token <the 64-hex token printed by provision.sh>
+```
+
+or, from a release with no checkout (no download token needed):
+
+```powershell
+.\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local -Token <the 64-hex token>
+```
+
+`install.ps1` also accepts `-BundleDir`, `-BundleUrl`, `-Release` and the
+legacy `-SourcePath`, and supports `-WhatIf` in every mode; the public download
+path needs no token (`-BundleToken` is only for a private fork). Both
+`install.ps1` and the Go `yab install` command copy **both** `yab.exe` and
+`yabw.exe` and register the logon task against **`yabw.exe`**, the windowless
+(GUI-subsystem) build of `cmd/yab`, so the tray starts at logon without a
+console window; `yab.exe` stays the console CLI. See
+[setup-windows.md](docs/setup-windows.md).
+
 Read [security.md](docs/security.md) before exposing anything: the management
 API has a token and an allowlist but **no TLS**, and USB/IP on 3240 is
 unauthenticated.
@@ -67,11 +104,12 @@ internal/elevate    UAC elevation check and runas relaunch
 internal/tray       Windows notification-area UI (no-op off Windows)
 internal/sdnotify   systemd sd_notify (READY/WATCHDOG/STATUS), stdlib only
 internal/version    build-time version metadata (set via -ldflags -X)
-deploy/pi           provisioning/uninstall scripts, systemd units, modprobe
-                    blacklist, udev rule, agent example config
+deploy/pi           provisioning/uninstall scripts, curl bootstrap (install.sh),
+                    systemd units, modprobe blacklist, udev rule, agent config
 deploy/windows      install/uninstall PowerShell, client example config
-scripts/build.ps1   cross-build dist/ artefacts for all three targets
+scripts/build.ps1   cross-build dist/ artefacts (yab, yabw, both yabd targets)
 scripts/deploy-pi.ps1  scp + ssh provisioning from Windows
+scripts/release.ps1  cut a GitHub release and attach the built artefacts
 scripts/check.ps1   local validation gate (gofmt, vet, test, build, cross-build)
 docs/               architecture, configuration, API, security and setup guides
 docs/adr/           architecture decision records
@@ -94,7 +132,7 @@ yab attach <device> | --all    attach (requires elevation)
 yab detach <device> | --all    detach (requires elevation)
 yab status                     servers, reachability and attached ports
 yab doctor                     usbip, driver, elevation, Secure Boot, agents
-yab install | uninstall        copy to %ProgramFiles%, ACL, logon task
+yab install | uninstall        copy yab.exe+yabw.exe to %ProgramFiles%, ACL, windowless logon task
 ```
 
 `yab tray` also serves a **local browser UI** (loopback only, on by default).
@@ -114,7 +152,8 @@ and `golang.org/x/sys`, both confined to the Windows `yab` build (plus
 `godbus/dbus` as an indirect Linux-only requirement of systray).
 
 ```powershell
-# Cross-build dist/yab-windows-amd64.exe, dist/yabd-linux-arm64,
+# Cross-build dist/yab-windows-amd64.exe (console CLI), the windowless
+# dist/yabw-windows-amd64.exe (tray), dist/yabd-linux-arm64 and
 # dist/yabd-linux-armv7 (version metadata is stamped from git).
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
 

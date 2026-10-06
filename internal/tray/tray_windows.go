@@ -23,7 +23,12 @@ func onReady(ctx context.Context, c Controller) {
 	systray.SetTitle("you-as-bee")
 	systray.SetTooltip("you-as-bee USB-over-LAN")
 
-	status := systray.AddMenuItem("starting...", "")
+	// st owns the one-off menu-action error. The periodic refresh owns the
+	// base summary and renders both, so the line is never left stale on
+	// "starting..." and an error is not silently overwritten a tick later.
+	st := &statusState{}
+
+	status := systray.AddMenuItem(summaryText(c.Devices()), "")
 	status.Disable()
 	systray.AddSeparator()
 
@@ -35,7 +40,9 @@ func onReady(ctx context.Context, c Controller) {
 				return
 			case <-openUI.ClickedCh:
 				if err := c.OpenUI(); err != nil {
-					status.SetTitle("web UI: " + err.Error())
+					st.fail(err)
+				} else {
+					st.clear()
 				}
 			}
 		}
@@ -53,7 +60,7 @@ func onReady(ctx context.Context, c Controller) {
 		pins = append(pins, d.Pin)
 		toggles = append(toggles, toggle)
 		lines = append(lines, line)
-		go watchToggle(ctx, c, status, d.Pin, toggle)
+		go watchToggle(ctx, c, st, d.Pin, toggle)
 	}
 
 	if !c.Elevated() {
@@ -66,7 +73,9 @@ func onReady(ctx context.Context, c Controller) {
 					return
 				case <-elevateItem.ClickedCh:
 					if err := c.RestartElevated(); err != nil {
-						status.SetTitle("restart failed: " + err.Error())
+						st.fail(err)
+					} else {
+						st.clear()
 					}
 				}
 			}
@@ -82,12 +91,12 @@ func onReady(ctx context.Context, c Controller) {
 		systray.Quit()
 	}()
 
-	go refresh(ctx, c, status, pins, toggles, lines)
+	go refresh(ctx, c, status, st, pins, toggles, lines)
 }
 
 // watchToggle handles one device's attach/detach item, reading the live status
 // from the controller on every click so it never acts on a stale view.
-func watchToggle(ctx context.Context, c Controller, status *systray.MenuItem, pin string, toggle *systray.MenuItem) {
+func watchToggle(ctx context.Context, c Controller, st *statusState, pin string, toggle *systray.MenuItem) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -106,13 +115,18 @@ func watchToggle(ctx context.Context, c Controller, status *systray.MenuItem, pi
 				err = c.Attach(pin)
 			}
 			if err != nil {
-				status.SetTitle("error: " + err.Error())
+				st.fail(err)
+			} else {
+				st.clear()
 			}
 		}
 	}
 }
 
-func refresh(ctx context.Context, c Controller, status *systray.MenuItem, pins []string, toggles, lines []*systray.MenuItem) {
+// refresh owns the status line on every tick: it recomputes the summary from
+// the live device states, so the line is always accurate and never stuck on its
+// startup value, and renders any pending menu-action error beside it.
+func refresh(ctx context.Context, c Controller, status *systray.MenuItem, st *statusState, pins []string, toggles, lines []*systray.MenuItem) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -121,8 +135,9 @@ func refresh(ctx context.Context, c Controller, status *systray.MenuItem, pins [
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			byPin := make(map[string]Device)
-			for _, d := range c.Devices() {
+			devices := c.Devices()
+			byPin := make(map[string]Device, len(devices))
+			for _, d := range devices {
 				byPin[d.Pin] = d
 			}
 			for i, pin := range pins {
@@ -133,6 +148,7 @@ func refresh(ctx context.Context, c Controller, status *systray.MenuItem, pins [
 				lines[i].SetTitle(statusText(d))
 				toggles[i].SetTitle(toggleLabel(d))
 			}
+			status.SetTitle(st.line(summaryText(devices)))
 		}
 	}
 }

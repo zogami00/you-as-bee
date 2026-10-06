@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -108,7 +109,16 @@ func TestOpenUIFailureDoesNotLeakLoginCode(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("parse launched URL %q: %v", launched, perr)
 	}
-	code := u.Query().Get("code")
+	// The code must be a path segment, not a query value: explorer.exe rejects
+	// a URL containing "?" and opens a folder instead of the browser.
+	if u.RawQuery != "" {
+		t.Errorf("the login URL carries a query string: %q", launched)
+	}
+	const codePrefix = "/ui/login/"
+	if !strings.HasPrefix(u.Path, codePrefix) {
+		t.Fatalf("launchBrowser was not called with a path code URL: %q", launched)
+	}
+	code := strings.TrimPrefix(u.Path, codePrefix)
 	if code == "" {
 		t.Fatalf("launchBrowser was not called with a code URL: %q", launched)
 	}
@@ -147,6 +157,46 @@ func TestExplorerPathIsAbsolute(t *testing.T) {
 	got = explorerPath()
 	if !filepath.IsAbs(got) || !strings.HasSuffix(strings.ToLower(got), "explorer.exe") {
 		t.Errorf("explorerPath() with an empty SystemRoot = %q, want an absolute path ending in explorer.exe", got)
+	}
+}
+
+// TestOpenUILaunchesOnceOnNonZeroExit is the regression test for the browser
+// opening twice: explorer.exe exits 1 even when it successfully hands the URL
+// to the shell, so openUI must treat the exit status as meaningless and launch
+// exactly once. The substituted launcher starts successfully and exits 1,
+// mirroring the real explorer.exe. A fallback launcher would make calls == 2.
+func TestOpenUILaunchesOnceOnNonZeroExit(t *testing.T) {
+	orig := explorerCommand
+	calls := 0
+	explorerCommand = func(string) *exec.Cmd {
+		calls++
+		return exec.Command("cmd.exe", "/c", "exit", "1")
+	}
+	t.Cleanup(func() { explorerCommand = orig })
+
+	if err := openUI("http://127.0.0.1:1/ui/login/code"); err != nil {
+		t.Fatalf("openUI with a launcher that exits non-zero = %v, want nil", err)
+	}
+	if calls != 1 {
+		t.Fatalf("openUI launched the browser %d times, want exactly 1", calls)
+	}
+}
+
+// TestOpenUIReportsStartFailure: only a cmd.Start() failure is an error, and it
+// is reported so the tray's existing message can show.
+func TestOpenUIReportsStartFailure(t *testing.T) {
+	orig := explorerCommand
+	explorerCommand = func(string) *exec.Cmd {
+		return exec.Command(filepath.Join(t.TempDir(), "definitely-not-explorer.exe"))
+	}
+	t.Cleanup(func() { explorerCommand = orig })
+
+	err := openUI("http://127.0.0.1:1/ui/login/code")
+	if err == nil {
+		t.Fatal("openUI with a missing launcher = nil, want a start error")
+	}
+	if !strings.Contains(err.Error(), "explorer.exe") {
+		t.Errorf("openUI error = %q, want it to name explorer.exe", err)
 	}
 }
 
@@ -204,7 +254,11 @@ func TestWebUIHTTPNeverExposesToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse login URL: %v", err)
 	}
-	code := u.Query().Get("code")
+	const codePrefix = "/ui/login/"
+	if u.RawQuery != "" || !strings.HasPrefix(u.Path, codePrefix) {
+		t.Fatalf("NewLoginURL must use the query-free path form: %q", loginURL)
+	}
+	code := strings.TrimPrefix(u.Path, codePrefix)
 	if code == "" {
 		t.Fatalf("NewLoginURL carried no code: %q", loginURL)
 	}

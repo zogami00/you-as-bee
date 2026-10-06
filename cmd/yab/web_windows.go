@@ -150,14 +150,37 @@ func explorerPath() string {
 	return filepath.Join(root, "explorer.exe")
 }
 
-// openUI starts explorer.exe with the URL. explorer.exe hands the URL to the
-// shell's already-running (unelevated) process, so the browser starts with the
-// user's normal token. It does not wait for the browser.
+// explorerCommand builds the explorer.exe hand-off for rawURL. It is a package
+// variable so tests can substitute a launcher without invoking the real shell.
+var explorerCommand = func(rawURL string) *exec.Cmd {
+	return exec.Command(explorerPath(), rawURL)
+}
+
+// openUI opens rawURL in the default browser, de-elevated.
+//
+// It must start explorer.exe, not ShellExecute or rundll32: the tray runs
+// elevated, and explorer.exe hands the URL to the already-running unelevated
+// shell, so the browser does not inherit the elevated token.
+//
+// The URL must contain no query string. explorer.exe treats a URL containing
+// "?" as a filesystem path: it launches no browser and opens a folder window.
+// That is why NewLoginURL puts the one-time code in a path segment
+// (GET /ui/login/<code>) instead of ?code=...; do not "tidy" it back into a
+// query string.
+//
+// explorer.exe's exit status is NOT a failure signal: it exits 1 even when it
+// successfully hands the URL to the shell (verified on Windows 11). There is
+// deliberately no fallback launcher: a second launch would open the UI twice,
+// and a fallback such as rundll32 would run from the elevated tray and could
+// start the browser with the elevated token - exactly what the explorer
+// hand-off avoids. Only a cmd.Start() failure is reported, so the tray's
+// message can still tell the user to reopen the UI from the tray.
 func openUI(rawURL string) error {
-	cmd := exec.Command(explorerPath(), rawURL)
+	cmd := explorerCommand(rawURL)
 	if err := cmd.Start(); err != nil {
-		return err
+		return fmt.Errorf("explorer.exe: %w", err)
 	}
-	// Do not wait for explorer.exe; release the process handle.
+	// Do not wait for explorer.exe; its exit status is meaningless and the
+	// shell hand-off is already under way. Release the process handle.
 	return cmd.Process.Release()
 }

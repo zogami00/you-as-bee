@@ -8,7 +8,9 @@
 #   2. go vet ./...
 #   3. go test ./...
 #   4. go build ./...
-#   5. the three cross-builds (windows/amd64, linux/arm64, linux/arm GOARM=7)
+#   5. the four cross-builds (windows/amd64 console yab, windows/amd64 GUI
+#      yabw, linux/arm64, linux/arm GOARM=7), asserting the PE subsystem of
+#      each Windows binary (3 = console, 2 = GUI/windowless).
 #
 # NOTE: `go test -race` is intentionally excluded. The race detector requires
 # cgo/gcc, and this project builds with CGO_ENABLED=0 and has no gcc dependency
@@ -58,10 +60,33 @@ try {
     }
 
     $targets = @(
-        [pscustomobject]@{ Name = 'yab-windows-amd64.exe'; Package = './cmd/yab';  TargetGOOS = 'windows'; TargetGOARCH = 'amd64'; TargetGOARM = '' },
-        [pscustomobject]@{ Name = 'yabd-linux-arm64';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm64'; TargetGOARM = '' },
-        [pscustomobject]@{ Name = 'yabd-linux-armv7';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm';   TargetGOARM = '7' }
+        [pscustomobject]@{ Name = 'yab-windows-amd64.exe';  Package = './cmd/yab';  TargetGOOS = 'windows'; TargetGOARCH = 'amd64'; TargetGOARM = ''; Ldflags = '';              PeSubsystem = 3 },
+        [pscustomobject]@{ Name = 'yabw-windows-amd64.exe'; Package = './cmd/yab';  TargetGOOS = 'windows'; TargetGOARCH = 'amd64'; TargetGOARM = ''; Ldflags = '-H windowsgui'; PeSubsystem = 2 },
+        [pscustomobject]@{ Name = 'yabd-linux-arm64';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm64'; TargetGOARM = ''; Ldflags = '';              PeSubsystem = 0 },
+        [pscustomobject]@{ Name = 'yabd-linux-armv7';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm';   TargetGOARM = '7'; Ldflags = '';             PeSubsystem = 0 }
     )
+
+    # Get-PeSubsystem reads the COFF optional-header Subsystem word (2 = GUI,
+    # 3 = console) from a PE file. It is how check.ps1 guards that yabw.exe is
+    # still built with -H windowsgui.
+    function Get-PeSubsystem([string]$Path) {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try {
+            $br = New-Object System.IO.BinaryReader($fs)
+            try {
+                $fs.Position = 0x3C
+                $lfanew = $br.ReadInt32()
+                # Subsystem is at optional-header offset 68, after the 4-byte PE
+                # signature and the 20-byte IMAGE_FILE_HEADER.
+                $fs.Position = $lfanew + 4 + 20 + 68
+                return [int]$br.ReadUInt16()
+            } finally {
+                $br.Dispose()
+            }
+        } finally {
+            $fs.Dispose()
+        }
+    }
 
     foreach ($t in $targets) {
         $env:GOOS = $t.TargetGOOS
@@ -73,9 +98,22 @@ try {
         }
 
         $out = Join-Path $dist $t.Name
-        & go build -o $out $t.Package
+        $buildArgs = @('-o', $out)
+        if (-not [string]::IsNullOrEmpty($t.Ldflags)) {
+            $buildArgs += @('-ldflags', $t.Ldflags)
+        }
+        $buildArgs += $t.Package
+        & go build @buildArgs
         if ($LASTEXITCODE -ne 0) { throw ("cross-build failed: {0}" -f $t.Name) }
-        Write-Host ("cross-build OK  {0}" -f $t.Name)
+        if ($t.PeSubsystem -gt 0) {
+            $sub = Get-PeSubsystem $out
+            if ($sub -ne $t.PeSubsystem) {
+                throw ("{0}: PE subsystem {1}, want {2}" -f $t.Name, $sub, $t.PeSubsystem)
+            }
+            Write-Host ("cross-build OK  {0} (PE subsystem {1})" -f $t.Name, $sub)
+        } else {
+            Write-Host ("cross-build OK  {0}" -f $t.Name)
+        }
     }
 }
 finally {

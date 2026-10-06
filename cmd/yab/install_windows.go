@@ -54,10 +54,16 @@ func cmdUninstall(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// doInstall copies the binary, locks down the data directory and registers the
-// logon task. It is idempotent.
+// doInstall copies both binaries, locks down the data directory and registers
+// the logon task. It is idempotent.
 func doInstall(ctx context.Context, r execx.Runner) error {
 	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	// The logon task must run the windowless (GUI-subsystem) build, so require
+	// yabw.exe beside the console binary before changing anything.
+	srcYabw, err := windowlessSource(exe)
 	if err != nil {
 		return err
 	}
@@ -67,14 +73,21 @@ func doInstall(ctx context.Context, r execx.Runner) error {
 	}
 	dir := filepath.Join(pf, "you-as-bee")
 	target := filepath.Join(dir, "yab.exe")
+	targetW := filepath.Join(dir, "yabw.exe")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	// Stop a running tray before copying: a locked yab.exe cannot be replaced.
+	// Stop a running tray before copying: a locked yab.exe/yabw.exe cannot be
+	// replaced.
 	stopClient(ctx, r)
 	if !strings.EqualFold(exe, target) {
 		if err := copyFile(exe, target); err != nil {
 			return fmt.Errorf("copy binary: %w", err)
+		}
+	}
+	if !strings.EqualFold(srcYabw, targetW) {
+		if err := copyFile(srcYabw, targetW); err != nil {
+			return fmt.Errorf("copy windowless binary: %w", err)
 		}
 	}
 
@@ -91,10 +104,25 @@ func doInstall(ctx context.Context, r execx.Runner) error {
 		return fmt.Errorf("icacls: %w: %s", err, strings.TrimSpace(se))
 	}
 
-	if err := registerTask(ctx, r, target); err != nil {
+	if err := registerTask(ctx, r, targetW); err != nil {
 		return err
 	}
 	return nil
+}
+
+// windowlessSource returns the path to yabw.exe, the GUI-subsystem build that
+// must sit beside the running console binary. It fails with a clear message
+// naming the missing file, rather than letting install register a logon task
+// that opens a console window.
+func windowlessSource(exe string) (string, error) {
+	p := filepath.Join(filepath.Dir(exe), "yabw.exe")
+	if _, err := os.Stat(p); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("windowless build not found: %s (install both yab.exe and yabw.exe; build them with scripts\\build.ps1)", p)
+		}
+		return "", fmt.Errorf("check %s: %w", p, err)
+	}
+	return p, nil
 }
 
 // registerTask creates the highest-privilege logon task through the
@@ -126,19 +154,23 @@ func psSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// stopClient ends the logon task and any running yab.exe other than this
-// process, so install can overwrite the binary and uninstall can remove it.
-// An in-place install/uninstall must not kill itself mid-run.
+// stopClient ends the logon task and any running yab.exe/yabw.exe other than
+// this process, so install can overwrite the binaries and uninstall can remove
+// them. Both process names are stopped: older installs ran yab.exe, current
+// ones run yabw.exe. An in-place install/uninstall must not kill itself
+// mid-run.
 func stopClient(ctx context.Context, r execx.Runner) {
 	_, _, _ = r.Run(ctx, "schtasks", "/End", "/TN", taskName)
-	_, _, _ = r.Run(ctx, "taskkill", "/IM", "yab.exe", "/F",
-		"/FI", fmt.Sprintf("PID ne %d", os.Getpid()))
+	for _, image := range []string{"yab.exe", "yabw.exe"} {
+		_, _, _ = r.Run(ctx, "taskkill", "/IM", image, "/F",
+			"/FI", fmt.Sprintf("PID ne %d", os.Getpid()))
+	}
 }
 
 // doUninstall removes the logon task and the installed binary directory. The
 // config in %ProgramData% is deliberately left in place.
 func doUninstall(ctx context.Context, r execx.Runner) error {
-	// Stop the tray first: Remove-Item fails on a locked yab.exe.
+	// Stop the tray first: Remove-Item fails on a locked yab.exe/yabw.exe.
 	stopClient(ctx, r)
 	if _, se, err := r.Run(ctx, "schtasks", "/Delete", "/TN", taskName, "/F"); err != nil {
 		// A missing task is fine; report any other failure.

@@ -64,21 +64,102 @@ cd deploy\windows
 .\install.ps1 -PiHost raspberrypi.local -Token <the 64-hex token printed by provision.sh>
 ```
 
+Or install directly from a released bundle, with no checkout:
+
+```powershell
+cd deploy\windows
+.\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local -Token <the 64-hex token>
+```
+
+`-Release` accepts a tag or `latest` and needs **no token**: the repository is
+public, so the assets come from the plain release download URL. (`-BundleToken`
+is only for a private fork.)
+
 `install.ps1`:
 
 - reports whether `usbip.exe` was found and its version;
 - optionally verifies a `usbip-win2` archive SHA-256;
 - **reports** test-signing and Secure Boot state and changes neither;
-- copies `yab.exe` to `%ProgramFiles%\you-as-bee\yab.exe` (stopping a running
-  tray first so the locked binary can be replaced);
+- copies **both** `yab.exe` and `yabw.exe` to `%ProgramFiles%\you-as-bee\`
+  (stopping a running tray first so the locked binaries can be replaced);
 - creates `%ProgramData%\you-as-bee` and restricts it to Administrators and
   SYSTEM **before** writing the token-bearing config;
 - writes `%ProgramData%\you-as-bee\client.json` from `client.example.json`;
-- registers a highest-privilege logon Scheduled Task running `yab.exe tray`,
+- registers a highest-privilege logon Scheduled Task running `yabw.exe tray`,
   with an unlimited execution-time limit and battery-friendly settings.
 
-It supports `-WhatIf` (safe without elevation) and is idempotent. If you omit
-`-PiHost`/`-Token`, edit the config afterwards.
+It supports `-WhatIf` (safe without elevation) and is idempotent: a second run
+changes nothing and reports `Install complete: no changes were needed.` If you
+omit `-PiHost`/`-Token`, edit the config afterwards.
+
+### Why there are two binaries
+
+`cmd/yab` is one program that is both the tray and the CLI. Compiled normally
+it is a **console** binary, so starting the tray (`yab.exe tray`) opens a black
+console window and closing that window kills the tray. `yabw.exe` is the **same
+package built a second time** with `-ldflags "-H windowsgui"` (Go's GUI
+subsystem), so Windows gives it no console at all. There is no code
+duplication and nothing to keep in sync: it is the identical main package.
+
+- `yab.exe` stays a console binary and is what you type into a prompt: `yab
+  list`, `yab status`, `yab doctor`, `yab attach`, ...
+- `yabw.exe` is the **tray only**. Because it has no console, its CLI
+  subcommands have nowhere to print: `yabw.exe list` runs but produces no
+  visible output. Launch it with no arguments (or `tray`) and use `yab.exe` for
+  everything else.
+- The logon task runs `yabw.exe tray`, so logon does not open a console for the
+  tray itself. Because `yabw.exe` has no console, any console child it runs
+  (`usbip.exe`) is started with `CREATE_NO_WINDOW` so it does not flash a
+  console window on each reconcile tick or attach.
+
+Because `yabw.exe` has no console, a **startup failure is silent**: if the tray
+exits or fails to start at logon, nothing is shown. To see the error, run
+`yab.exe tray` in a console (it is the same program), or set `"log_file"` in
+`client.json` to a writable path (for example
+`%ProgramData%\you-as-bee\yab.log`); the tray appends its log records there
+once it has read the config, so a failure after config load is captured without
+any new machinery.
+
+To migrate an existing install whose task still runs `yab.exe`, re-run
+`install.ps1 -Force` (the task name is unchanged, so a plain re-run keeps the
+old action).
+
+The Go subcommand `yab install` matches `install.ps1`: it copies **both**
+`yab.exe` and `yabw.exe` into `%ProgramFiles%\you-as-bee\`, stops both process
+names, and registers the logon task against `yabw.exe tray`. If `yabw.exe` is
+not beside the `yab.exe` you run `yab install` from, it fails with a message
+naming the missing file rather than registering a console-launching task.
+`yab uninstall` stops and removes both.
+
+### Installer source modes
+
+`install.ps1` can get the binaries from four places, in this order of
+preference:
+
+1. **Local bundle** (default): `-BundleDir <dir>`, or the script's own
+   directory when it already contains `yab.exe` and `yabw.exe`. This is what a
+   packaged release looks like - no checkout, no `dist\` layout.
+2. **GitHub release**: `-Release <tag>` (or `latest`). The public repository
+   needs no token, so assets come from the plain release download URL
+   (`https://github.com/<repo>/releases/download/<tag>/<asset>`). A private fork
+   passes `-BundleToken <token>`, which switches to the authenticated GitHub API
+   asset path; the token is sent only as a request header and is never written
+   to disk.
+3. **Generic download**: `-BundleUrl <base-url>` fetches `<base-url>/yab.exe`,
+   `<base-url>/yabw.exe` and `<base-url>/client.example.json` to a temporary
+   directory. For a private host pass `-BundleToken <token>`; the token is sent
+   as `Authorization: Bearer <token>`. Every download must be non-empty and each
+   binary must have a valid PE header (`MZ` plus a `PE\0\0` signature), so an
+   HTML error page saved as `yab.exe` is rejected before anything reaches
+   `%ProgramFiles%`.
+4. **Legacy checkout layout**: `-SourcePath` (default
+   `..\..\dist\yab-windows-amd64.exe`), with `yabw-windows-amd64.exe` expected
+   beside it. This preserves the previous behaviour for a working copy.
+
+`-WhatIf` works in all four modes. In release and download modes it still
+fetches the bundle into a temporary directory (so the URL and the file headers
+are validated) but changes nothing on the system; the temporary directory is
+always removed.
 
 `%ProgramData%\you-as-bee` is restricted to Administrators and SYSTEM because
 `client.json` holds the bearer token. Every `yab` command reads that file, so
@@ -131,10 +212,16 @@ client log records. Open it from the tray menu: **Open web UI**.
   non-loopback host, so it cannot be reached from another machine. There is no
   Windows firewall rule to add.
 - A **one-time code** does the authentication. The tray mints a code, opens
-  `http://127.0.0.1:<port>/ui/login?code=...` through `explorer.exe` (so the
+  `http://127.0.0.1:<port>/ui/login/<code>` through `explorer.exe` (so the
   browser starts de-elevated even though the tray runs elevated) and the code is
   bound to that browser. It is single-use and expires after 60 seconds; the code
-  leaves the URL as soon as it is redeemed.
+  leaves the URL as soon as it is redeemed. The code is a **path segment, not a
+  query string**, on purpose: `explorer.exe` treats a URL containing `?` as a
+  filesystem path, launches no browser and opens a folder window instead. The
+  URL is handed to `explorer.exe` and launched **once**; the launcher's exit
+  status is **not** inspected (explorer.exe exits 1 even on success), so there
+  is no fallback launcher that could open the UI twice or start the browser
+  elevated.
 - The browser **never receives the Pi token**. It holds only an
   `HttpOnly; SameSite=Strict` session cookie for the local server, and the
   loopback server talks to the Pi on the browser's behalf. See

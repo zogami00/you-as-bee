@@ -71,6 +71,63 @@ directory (including the `yabd` binary) and run:
 sudo ./provision.sh --binary ./yabd-linux-arm64 --client-cidr 192.168.1.0/24
 ```
 
+### One-line bootstrap (`curl | sudo bash`)
+
+`deploy/pi/install.sh` is a small bootstrap for exactly that: it fetches the
+deployment bundle, then hands off to `provision.sh` (it never duplicates the
+provisioning logic). Cut a release first with `scripts\release.ps1`, or point it
+at any bundle host.
+
+```bash
+# From a release asset. The repository is public, so no token is needed:
+curl -fsSL https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
+  | sudo bash -s -- --release v1.0.0
+```
+
+Omit `--release v1.0.0` to install the newest release: the bootstrap resolves
+the latest tag from the public `releases/latest` redirect (no token, no API
+call, no `jq`).
+
+What it does:
+
+- **Detects the architecture** and picks the matching binary: `aarch64`/`arm64`
+  -> `yabd-linux-arm64`; `armv7l`/`armhf` -> `yabd-linux-armv7`. Anything else
+  is refused with a clear message.
+- **Obtains the bundle** from, in order of preference: a local checkout (when
+  the script's directory, or `../../dist`, has `provision.sh` and the binary),
+  `--url <bundle-url>`, or a GitHub release (`--release [TAG]`, defaulting to
+  the latest release).
+- **Handles being piped.** When `BASH_SOURCE` is not a file (the `curl | sudo
+  bash` case) it fetches everything into a temporary directory and removes it
+  on exit.
+- **Passes through** `--client-cidr`, `--no-firewall`, `--binary` and
+  `--example` to `provision.sh`.
+- **Never prints a token.** A GitHub token is only used for a private fork.
+  Prefer the `GITHUB_TOKEN` environment variable, which is honoured only with
+  `--release`; the bootstrap writes it to a mode-`0600` `curl` config file in
+  the temporary directory, so it never appears in the log. The `--token <token>`
+  form also keeps the token out of the log, but the token is visible to other
+  users in `ps` because it is an argument to `install.sh`.
+
+**Private fork only.** This repository is public, so the normal path needs no
+token: each asset comes from the plain `browser_download_url`
+(`https://github.com/<slug>/releases/download/<tag>/<asset>`) with no API call
+and no `Accept` header. If you fork the repository and keep the fork **private**,
+set `GITHUB_TOKEN` with `repo` scope and use `--release` (recommended, because it
+never reaches a command line), or pass `--token <token>`; the bootstrap then uses
+the authenticated GitHub API asset path instead. A public bundle host (`--url`)
+likewise needs no token. `GITHUB_TOKEN` is deliberately ignored for `--url`, so
+an ambient token cannot be sent to an arbitrary host.
+
+`--url` must be an **`https://`** URL, because the bundle's `provision.sh` and
+`yabd` are run as root with no checksum or signature; `http://` is allowed only
+for `127.0.0.1`/`localhost` testing, and there the host must match exactly one
+of those two names or a suffix (`localhost.evil.example`) or userinfo
+(`localhost@evil.example`) would slip past a prefix check.
+
+It is idempotent, because `provision.sh` is: a second run reports `provision: no
+changes` and does not reprint the token.
+
 ### What provisioning does
 
 1. **Preflight** - root, Raspberry Pi OS bookworm, `modprobe usbip-host`

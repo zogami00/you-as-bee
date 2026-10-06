@@ -6,8 +6,13 @@
 #
 # Targets:
 #   dist/yab-windows-amd64.exe   ./cmd/yab   GOOS=windows GOARCH=amd64
+#   dist/yabw-windows-amd64.exe  ./cmd/yab   GOOS=windows GOARCH=amd64, -H windowsgui
 #   dist/yabd-linux-arm64        ./cmd/yabd  GOOS=linux   GOARCH=arm64
 #   dist/yabd-linux-armv7        ./cmd/yabd  GOOS=linux   GOARCH=arm   GOARM=7
+#
+# yabw is the same package built for the GUI subsystem: launching it opens no
+# console window (see docs/setup-windows.md). yab.exe stays a console binary so
+# the CLI (list, status, doctor, ...) keeps its output.
 
 $ErrorActionPreference = 'Stop'
 
@@ -50,9 +55,10 @@ try {
     }
 
     $targets = @(
-        [pscustomobject]@{ Name = 'yab-windows-amd64.exe'; Package = './cmd/yab';  TargetGOOS = 'windows'; TargetGOARCH = 'amd64'; TargetGOARM = '' },
-        [pscustomobject]@{ Name = 'yabd-linux-arm64';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm64'; TargetGOARM = '' },
-        [pscustomobject]@{ Name = 'yabd-linux-armv7';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm';   TargetGOARM = '7' }
+        [pscustomobject]@{ Name = 'yab-windows-amd64.exe';  Package = './cmd/yab';  TargetGOOS = 'windows'; TargetGOARCH = 'amd64'; TargetGOARM = '';  ExtraLdflags = '' },
+        [pscustomobject]@{ Name = 'yabw-windows-amd64.exe'; Package = './cmd/yab';  TargetGOOS = 'windows'; TargetGOARCH = 'amd64'; TargetGOARM = '';  ExtraLdflags = '-H windowsgui' },
+        [pscustomobject]@{ Name = 'yabd-linux-arm64';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm64'; TargetGOARM = '';  ExtraLdflags = '' },
+        [pscustomobject]@{ Name = 'yabd-linux-armv7';       Package = './cmd/yabd'; TargetGOOS = 'linux';   TargetGOARCH = 'arm';   TargetGOARM = '7'; ExtraLdflags = '' }
     )
 
     foreach ($t in $targets) {
@@ -69,7 +75,12 @@ try {
         $out = Join-Path $dist $t.Name
         Write-Host ("building {0}/{1}{2} {3} -> {4}" -f $t.TargetGOOS, $t.TargetGOARCH, $armLabel, $t.Package, $out)
 
-        & go build -trimpath -ldflags $ldflags -o $out $t.Package
+        $targetLdflags = $ldflags
+        if (-not [string]::IsNullOrEmpty($t.ExtraLdflags)) {
+            $targetLdflags = ("{0} {1}" -f $ldflags, $t.ExtraLdflags)
+        }
+
+        & go build -trimpath -ldflags $targetLdflags -o $out $t.Package
         if ($LASTEXITCODE -eq 0) {
             Write-Host ("  OK   {0}" -f $t.Name) -ForegroundColor Green
         } else {

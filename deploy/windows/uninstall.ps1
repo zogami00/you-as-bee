@@ -1,14 +1,15 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Remove the you-as-bee Windows client (yab).
+    Remove the you-as-bee Windows client (yab/yabw).
 
 .DESCRIPTION
     Removes the highest-privilege logon Scheduled Task and the installed
-    program directory, stopping the running tray first so the locked yab.exe
-    can be removed. The client config in %ProgramData%\you-as-bee is kept by
-    default, matching `yab uninstall`; use -RemoveConfig to delete it too. This
-    does not remove usbip-win2 or its driver.
+    program directory (both yab.exe and yabw.exe), stopping any running tray
+    first so the locked binaries can be removed. The client config in
+    %ProgramData%\you-as-bee is kept by default, matching `yab uninstall`; use
+    -RemoveConfig to delete it too. This does not remove usbip-win2 or its
+    driver.
 
     Windows PowerShell 5.1 compatible; ASCII only. Supports -WhatIf, which can
     be used without elevation (it performs no changes).
@@ -66,11 +67,11 @@ Write-Step 'logon task'
 
 $taskName = 'you-as-bee-client'
 if (Test-YabTaskExists $taskName) {
-    # Stop the running instance before deleting: its yab.exe locks the file we
-    # are about to remove.
+    # Stop the running instance before deleting: its yab.exe/yabw.exe lock the
+    # files we are about to remove.
     if (-not $DryRun) {
         [void](Stop-YabTask $taskName)
-        Get-Process -Name 'yab' -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-Process -Name @('yab', 'yabw') -ErrorAction SilentlyContinue | ForEach-Object {
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
         }
     }
