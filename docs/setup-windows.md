@@ -107,7 +107,18 @@ duplication and nothing to keep in sync: it is the identical main package.
   subcommands have nowhere to print: `yabw.exe list` runs but produces no
   visible output. Launch it with no arguments (or `tray`) and use `yab.exe` for
   everything else.
-- The logon task runs `yabw.exe tray`, so logon no longer flashes a console.
+- The logon task runs `yabw.exe tray`, so logon does not open a console for the
+  tray itself. Because `yabw.exe` has no console, any console child it runs
+  (`usbip.exe`) is started with `CREATE_NO_WINDOW` so it does not flash a
+  console window on each reconcile tick or attach.
+
+Because `yabw.exe` has no console, a **startup failure is silent**: if the tray
+exits or fails to start at logon, nothing is shown. To see the error, run
+`yab.exe tray` in a console (it is the same program), or set `"log_file"` in
+`client.json` to a writable path (for example
+`%ProgramData%\you-as-bee\yab.log`); the tray appends its log records there
+once it has read the config, so a failure after config load is captured without
+any new machinery.
 
 To migrate an existing install whose task still runs `yab.exe`, re-run
 `install.ps1 -Force` (the task name is unchanged, so a plain re-run keeps the
@@ -206,10 +217,11 @@ client log records. Open it from the tray menu: **Open web UI**.
   bound to that browser. It is single-use and expires after 60 seconds; the code
   leaves the URL as soon as it is redeemed. The code is a **path segment, not a
   query string**, on purpose: `explorer.exe` treats a URL containing `?` as a
-  filesystem path, launches no browser and opens a folder window instead.
-  (`explorer.exe` failing is detected, and the tray then falls back to
-  `rundll32.exe url.dll,FileProtocolHandler`, which may launch the browser
-  elevated.)
+  filesystem path, launches no browser and opens a folder window instead. The
+  URL is handed to `explorer.exe` and launched **once**; the launcher's exit
+  status is **not** inspected (explorer.exe exits 1 even on success), so there
+  is no fallback launcher that could open the UI twice or start the browser
+  elevated.
 - The browser **never receives the Pi token**. It holds only an
   `HttpOnly; SameSite=Strict` session cookie for the local server, and the
   loopback server talks to the Pi on the browser's behalf. See

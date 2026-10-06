@@ -97,6 +97,14 @@ the two binaries is the subsystem field in the PE header. The installer
 registers the logon task against `yabw.exe tray` and keeps `yab.exe` for the
 CLI.
 
+Because `yabw.exe` has no console of its own, the command runner
+(`internal/execx`) starts every console child - `usbip.exe` - with a Windows
+`SysProcAttr` of `HideWindow` plus `CREATE_NO_WINDOW`, so a console child does
+not allocate a window. Without it the tray would flash a console on every
+reconcile tick (5 s) and on each attach/detach, defeating the windowless build.
+The attribute is a `//go:build windows` file; the non-Windows counterpart
+returns `nil`, so the agent builds and runs unchanged on Linux.
+
 ## Windows local web UI
 
 `yab tray` can serve the same embedded shell (`internal/webui/assets`) from a
@@ -113,10 +121,12 @@ not a second supervisor:
   `HttpOnly; SameSite=Strict` session cookie and leaves the code out of the URL.
   Session writes require `X-YAB-CSRF: 1`.
 - The code travels as a **path segment** (`GET /ui/login/<code>`), never a query
-  string. `explorer.exe` rejects a URL containing `?` and opens a folder instead
-  of the browser, which would break the de-elevated launch. `NewLoginURL` has a
-  test asserting the URL stays query-free; when `explorer.exe` nevertheless
-  fails, the launcher falls back to `rundll32.exe url.dll,FileProtocolHandler`.
+  string. `explorer.exe` treats a URL containing `?` as a filesystem path and
+  opens a folder instead of the browser, which would break the de-elevated
+  launch, so `NewLoginURL` has a test asserting the URL stays query-free. The
+  URL is handed to `explorer.exe`; its **exit status is not meaningful** (it
+  exits 1 even on a successful hand-off on Windows 11), so it is not inspected
+  and there is no fallback launcher.
 - **The browser never sees a Pi token.** The local server's payload types carry
   no credential; `Attach`/`Detach` are forwarded in-process to the same
   supervisor methods the tray menu calls, so the loopback server talks to the Pi

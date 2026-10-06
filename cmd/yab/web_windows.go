@@ -150,71 +150,37 @@ func explorerPath() string {
 	return filepath.Join(root, "explorer.exe")
 }
 
-// rundll32Path returns the absolute path of rundll32.exe under
-// %SystemRoot%\System32, with the same no-PATH discipline as explorerPath.
-func rundll32Path() string {
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = `C:\Windows`
-	}
-	return filepath.Join(root, "System32", "rundll32.exe")
+// explorerCommand builds the explorer.exe hand-off for rawURL. It is a package
+// variable so tests can substitute a launcher without invoking the real shell.
+var explorerCommand = func(rawURL string) *exec.Cmd {
+	return exec.Command(explorerPath(), rawURL)
 }
 
-// launchTimeout bounds how long openUI waits for explorer.exe to report an exit
-// code. explorer.exe hands a URL to the shell and exits promptly; a process
-// still alive after this is treated as a successful hand-off rather than
-// blocking the click handler. It is a variable for tests.
-var launchTimeout = 5 * time.Second
-
-// launchExplorer starts explorer.exe with the URL and reports a non-zero exit.
-// explorer.exe exits non-zero when it does not accept the argument as a URL
-// (for example a URL containing "?"), which is the failure this detects. It
-// hands an accepted URL to the shell's already-running (unelevated) process, so
-// the browser starts with the user's normal token.
-func launchExplorer(rawURL string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), launchTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, explorerPath(), rawURL)
-	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		// explorer.exe is still running, so it did not reject the URL and its
-		// shell hand-off is under way; do not fall back and launch a second
-		// browser. The child is killed by the context.
-		return nil
-	}
-	return err
-}
-
-// launchViaRundll32 hands the URL to the shell's registered URL handler
-// directly. Unlike explorer.exe it does not de-elevate the browser: it may
-// launch it with the tray's elevated token. That is acceptable because it is
-// only used when the de-elevated path (explorer.exe) is unavailable.
-func launchViaRundll32(rawURL string) error {
-	cmd := exec.Command(rundll32Path(), "url.dll,FileProtocolHandler", rawURL)
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	// Do not wait for the handler; release the process handle.
-	return cmd.Process.Release()
-}
-
-// openUI opens rawURL in the default browser, de-elevated where possible.
+// openUI opens rawURL in the default browser, de-elevated.
 //
-// It must start with explorer.exe, not ShellExecute or rundll32: the tray runs
+// It must start explorer.exe, not ShellExecute or rundll32: the tray runs
 // elevated, and explorer.exe hands the URL to the already-running unelevated
 // shell, so the browser does not inherit the elevated token.
 //
 // The URL must contain no query string. explorer.exe treats a URL containing
-// "?" as a filesystem path: it launches no browser, exits 1 and opens a folder
-// window. That is why NewLoginURL puts the one-time code in a path segment
+// "?" as a filesystem path: it launches no browser and opens a folder window.
+// That is why NewLoginURL puts the one-time code in a path segment
 // (GET /ui/login/<code>) instead of ?code=...; do not "tidy" it back into a
-// query string. When explorer.exe does fail (non-zero exit), fall back to
-// rundll32 so the UI still opens, and only report an error if that fails too.
+// query string.
+//
+// explorer.exe's exit status is NOT a failure signal: it exits 1 even when it
+// successfully hands the URL to the shell (verified on Windows 11). There is
+// deliberately no fallback launcher: a second launch would open the UI twice,
+// and a fallback such as rundll32 would run from the elevated tray and could
+// start the browser with the elevated token - exactly what the explorer
+// hand-off avoids. Only a cmd.Start() failure is reported, so the tray's
+// message can still tell the user to reopen the UI from the tray.
 func openUI(rawURL string) error {
-	if err := launchExplorer(rawURL); err != nil {
-		if err2 := launchViaRundll32(rawURL); err2 != nil {
-			return fmt.Errorf("explorer.exe: %v; rundll32: %w", err, err2)
-		}
+	cmd := explorerCommand(rawURL)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("explorer.exe: %w", err)
 	}
-	return nil
+	// Do not wait for explorer.exe; its exit status is meaningless and the
+	// shell hand-off is already under way. Release the process handle.
+	return cmd.Process.Release()
 }

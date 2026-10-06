@@ -18,7 +18,8 @@
       * writes %ProgramData%\you-as-bee\client.json from client.example.json;
       * restricts %ProgramData%\you-as-bee to Administrators and SYSTEM;
       * registers a highest-privilege logon Scheduled Task running "yabw.exe
-        tray" (the GUI-subsystem build, so logon opens no console window).
+        tray" (the GUI-subsystem build, so logon opens no console window for
+        the tray; console children such as usbip.exe are started hidden).
 
     The binaries come from one of four places, in this order of preference:
 
@@ -26,10 +27,12 @@
          already contains yab.exe and yabw.exe (the default for a packaged
          install);
       2. a GitHub release: -Release <tag> (or 'latest'). The public repository
-         needs no token: assets come from the plain browser_download_url. Pass
-         -BundleToken only for a private fork, which switches to the
-         authenticated API path;
-      3. a generic download: -BundleUrl (with an optional -BundleToken bearer);
+         needs no token: assets come from the plain browser_download_url. For a
+         private fork, set GITHUB_TOKEN (preferred; it stays off the command
+         line) or pass -BundleToken, which switches to the authenticated API
+         path;
+      3. a generic download: -BundleUrl (https:// only; http:// is allowed just
+         for 127.0.0.1/localhost testing) with an optional -BundleToken bearer;
       4. the legacy checkout layout: -SourcePath, default
          ..\..\dist\yab-windows-amd64.exe, with yabw-windows-amd64.exe beside
          it.
@@ -53,13 +56,14 @@
 
 .PARAMETER BundleUrl
     Base URL of a bundle; the installer fetches <url>/yab.exe, <url>/yabw.exe
-    and <url>/client.example.json.
+    and <url>/client.example.json. Must be https://; http:// is allowed only
+    for 127.0.0.1 or localhost testing.
 
 .PARAMETER Release
     GitHub release tag to install from, or 'latest' to resolve the newest
-    release. The public repository needs no token: assets come from the plain
-    browser_download_url. Only with -BundleToken does it use the authenticated
-    API path (private fork).
+    stable release. The public repository needs no token: assets come from the
+    plain browser_download_url. For a private fork, set GITHUB_TOKEN (preferred)
+    or -BundleToken, which switches to the authenticated API path.
 
 .PARAMETER Repo
     owner/repo slug used by -Release. Defaults to zogami00/you-as-bee.
@@ -67,7 +71,9 @@
 .PARAMETER BundleToken
     Optional bearer token. For -BundleUrl it is sent as "Authorization: Bearer
     <token>" on every download. For -Release it selects the authenticated API
-    path for a PRIVATE FORK; this repository is public and needs no token.
+    path for a PRIVATE FORK; this repository is public and needs no token. Prefer
+    the GITHUB_TOKEN environment variable (honoured only with -Release) because a
+    command-line token is visible in the process list.
 
 .PARAMETER PiHost
     When set, replaces the first server's host in the written config.
@@ -88,7 +94,8 @@
 .EXAMPLE
     .\install.ps1 -PiHost raspberrypi.local -Token 0123... -UsbipArchive .\usbip-win2.zip -UsbipSha256 ABCD...
     .\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local
-    .\install.ps1 -BundleUrl https://example.invalid/yab/ -BundleToken <token>
+    $env:GITHUB_TOKEN = '...'; .\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local
+    .\install.ps1 -BundleUrl https://example.invalid/yab/
     .\install.ps1 -WhatIf
 #>
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -114,6 +121,12 @@ $githubWeb = $env:YAB_GITHUB_WEB
 if (-not $githubWeb) { $githubWeb = 'https://github.com' }
 $githubApi = $env:YAB_GITHUB_API
 if (-not $githubApi) { $githubApi = 'https://api.github.com' }
+
+# Only the private-fork -Release path honours an ambient GITHUB_TOKEN. -BundleUrl
+# requires an explicit -BundleToken, so a token is never sent to whatever host
+# -BundleUrl names. Preferring the environment variable keeps the token out of
+# this process's command line.
+if (-not $BundleToken -and $Release) { $BundleToken = $env:GITHUB_TOKEN }
 
 # Shared task helpers: Test-YabTaskExists falls back to schtasks when
 # Get-ScheduledTask throws (see ScheduledTask.ps1).
@@ -207,10 +220,18 @@ function Get-YabFile([string]$Uri, [string]$Dest, [string]$Token, [bool]$Require
     $headers = @{ 'User-Agent' = 'you-as-bee-install' }
     if ($Token) { $headers['Authorization'] = ("Bearer {0}" -f $Token) }
     if ($Accept) { $headers['Accept'] = $Accept }
+    # The default progress bar makes a ~10 MB download very slow on Windows
+    # PowerShell 5.1; suppress it locally and restore it afterwards.
+    $savedProgress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
     try {
-        Invoke-WebRequest -Uri $Uri -OutFile $Dest -Headers $headers -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Fail ("download failed: {0}: {1}" -f $Uri, $_.Exception.Message)
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $Dest -Headers $headers -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Fail ("download failed: {0}: {1}" -f $Uri, $_.Exception.Message)
+        }
+    } finally {
+        $ProgressPreference = $savedProgress
     }
     if (-not (Test-Path -LiteralPath $Dest) -or (Get-Item -LiteralPath $Dest).Length -eq 0) {
         Fail ("downloaded file is empty: {0}" -f $Uri)
@@ -231,31 +252,34 @@ function Get-YabBundleFromUrl([string]$Url, [string]$Token, [string]$DestDir) {
     Get-YabFile -Uri ("{0}/client.example.json" -f $base) -Dest (Join-Path $DestDir 'client.example.json') -Token $Token -RequirePe $false -Accept ''
 }
 
-# Resolve-YabLatestTag returns the newest release tag for RepoSlug by reading
-# the public releases.atom feed (no token, no API call). The feed lists entries
-# newest first and each entry links to /releases/tag/<tag>.
+# Resolve-YabLatestTag returns the newest STABLE release tag for RepoSlug by
+# following the public releases/latest redirect (no token, no API call). This
+# matches the Pi installer's resolution: releases.atom also lists prereleases,
+# so the two platforms could otherwise pick different tags.
 function Resolve-YabLatestTag([string]$RepoSlug) {
-    $feedUrl = ("{0}/{1}/releases.atom" -f $githubWeb, $RepoSlug)
+    $latestUrl = ("{0}/{1}/releases/latest" -f $githubWeb, $RepoSlug)
+    $req = [System.Net.WebRequest]::Create($latestUrl)
+    $req.AllowAutoRedirect = $false
+    $req.Method = 'GET'
+    $resp = $null
     try {
-        $resp = Invoke-WebRequest -Uri $feedUrl -UseBasicParsing -ErrorAction Stop
-    } catch {
-        Fail ("could not resolve the latest release for {0}: {1}; pass an explicit -Release <tag>" -f $RepoSlug, $_.Exception.Message)
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        $resp = $_.Exception.Response
     }
+    if (-not $resp) {
+        Fail ("could not resolve the latest release for {0}; pass an explicit -Release <tag>" -f $RepoSlug)
+    }
+    $location = $null
     try {
-        [xml]$feed = $resp.Content
-    } catch {
-        Fail ("could not parse the release feed from {0}; pass an explicit -Release <tag>" -f $feedUrl)
+        $location = $resp.Headers['Location']
+    } finally {
+        $resp.Close()
     }
-    $entry = @($feed.feed.entry)[0]
-    if (-not $entry) {
-        Fail ("{0} has no releases; pass an explicit -Release <tag>" -f $RepoSlug)
+    if ($location -and ($location -match '/releases/tag/([^/]+)$')) {
+        return $Matches[1]
     }
-    foreach ($link in @($entry.link)) {
-        if ($link.href -and ($link.href -match '/releases/tag/([^/]+)$')) {
-            return $Matches[1]
-        }
-    }
-    Fail ("could not find a tag in the release feed for {0}" -f $RepoSlug)
+    Fail ("could not resolve the latest release for {0}; pass an explicit -Release <tag>" -f $RepoSlug)
 }
 
 # Get-YabReleaseFromPublic downloads the release assets from the plain public
@@ -344,6 +368,20 @@ try {
     $SourceW = $null
 
     if ($BundleUrl) {
+        # Reject a plaintext bundle URL: the downloaded yab.exe/yabw.exe are
+        # run, so https is required. http is allowed only for 127.0.0.1/localhost
+        # testing.
+        $bundleUri = $null
+        if (-not [System.Uri]::TryCreate($BundleUrl, [System.UriKind]::Absolute, [ref]$bundleUri)) {
+            Fail ("-BundleUrl is not an absolute URL: {0}" -f $BundleUrl)
+        }
+        if ($bundleUri.Scheme -ne 'https') {
+            $loopback = ($bundleUri.Host -eq '127.0.0.1') -or ($bundleUri.Host -eq 'localhost')
+            if (-not ($bundleUri.Scheme -eq 'http' -and $loopback)) {
+                Fail '-BundleUrl must use https:// (http:// is allowed only for 127.0.0.1 or localhost testing).'
+            }
+        }
+
         # Create the temporary directory with .NET, not New-Item: the latter
         # honours -WhatIfPreference and would skip the download directory in a
         # dry run (a -WhatIf run still downloads so the URL and the file headers

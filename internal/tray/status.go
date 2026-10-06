@@ -90,6 +90,12 @@ func summaryText(devices []Device) string {
 // attach/detach) has no persistent device state, so it is shown beside the
 // summary and kept until a later successful action clears it. It is never
 // dropped merely because a refresh tick arrived.
+//
+// That persistence is deliberate: a menu-action error can stay on the status
+// line indefinitely until a later successful action, because it is the only
+// signal the user gets that the click failed (yabw.exe has no console to print
+// to). Do not "fix" it by clearing on a timer or refresh tick; the user must be
+// able to see that the last action failed.
 type statusState struct {
 	mu        sync.Mutex
 	actionErr string

@@ -23,10 +23,12 @@
 # The GitHub repository is public, so a release download needs no token: each
 # asset is fetched from the plain browser_download_url
 # (https://github.com/<slug>/releases/download/<tag>/<asset>) with no API call
-# and no Accept header. A token is only needed for a private fork: pass
-# --token <token> or set GITHUB_TOKEN and the script uses the authenticated API
-# asset path instead. The token is written to a mode-0600 curl config file in a
-# temporary directory and is never printed.
+# and no Accept header. A token is only needed for a private fork: set
+# GITHUB_TOKEN with `--release` (preferred; it does not reach a command line) or
+# pass --token, and the script uses the authenticated API asset path instead.
+# GITHUB_TOKEN is only honoured for --release, so an ambient token is never
+# sent to a --url host. The token is written to a mode-0600 curl config file in
+# a temporary directory and is never printed.
 #
 # Usage:
 #   sudo ./install.sh [--url URL | --release [TAG]] [--token TOKEN]
@@ -48,7 +50,11 @@ GITHUB_API="${YAB_GITHUB_API:-https://api.github.com}"
 BUNDLE_URL=""
 RELEASE_TAG=""
 RELEASE_REQUESTED=0
-TOKEN="${GITHUB_TOKEN:-}"
+# TOKEN is only ever set explicitly (--token) or, for the release private-fork
+# path, from GITHUB_TOKEN. It is never taken from the ambient environment for
+# --url, so an ambient GITHUB_TOKEN cannot be sent to an arbitrary host.
+TOKEN=""
+ENV_TOKEN="${GITHUB_TOKEN:-}"
 CLIENT_CIDR=""
 NO_FIREWALL=0
 BINARY_OVERRIDE=""
@@ -70,20 +76,32 @@ cleanup() {
 		rm -rf "$TMP_DIR"
 	fi
 }
-trap cleanup EXIT HUP INT TERM
+# Fold cleanup into EXIT so it runs once on the normal path, and let each
+# signal trap run cleanup and then terminate with a non-zero status: a bare
+# "trap cleanup EXIT HUP INT TERM" would run cleanup and then continue, so the
+# script could delete its own bundle directory and still exit 0.
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 usage() {
 	cat <<'EOF'
 Usage: sudo ./install.sh [options]
 
   --url URL                     base URL of the bundle (fetch <URL>/provision.sh,
-                                the support files and the yabd binary).
+                                the support files and the yabd binary). Must be
+                                https://; http:// is allowed only for
+                                127.0.0.1/localhost testing.
   --release [TAG]               download a GitHub release; TAG defaults to the
                                 latest release (resolved from the public
                                 releases/latest redirect, no token needed).
-  --token TOKEN                 GitHub token for a PRIVATE FORK only (or set
-                                GITHUB_TOKEN); not needed for this repository.
-                                The token is never printed.
+  --token TOKEN                 GitHub token for a PRIVATE FORK only; not
+                                needed for this repository. Prefer the
+                                GITHUB_TOKEN environment variable, which is
+                                honoured only with --release and does not expose
+                                the token on the command line. --token itself is
+                                visible to other users via ps.
   --client-cidr CIDR[,CIDR...]  passed through to provision.sh.
   --no-firewall                 passed through to provision.sh.
   --binary PATH                 install this yabd binary instead of the bundle's.
@@ -93,6 +111,7 @@ Usage: sudo ./install.sh [options]
 
 Examples:
   curl -fsSL <url>/install.sh | sudo bash -s -- --release v1.0.0
+  GITHUB_TOKEN=... sudo -E bash install.sh --release v1.0.0   # private fork
   sudo ./install.sh --url https://example.invalid/yab
   sudo ./install.sh --binary ./dist/yabd-linux-arm64 --client-cidr 192.168.1.0/24
 EOF
@@ -150,6 +169,22 @@ while [ "$#" -gt 0 ]; do
 		;;
 	esac
 done
+
+# A network --url must be https: the bundle's provision.sh and yabd run as root
+# with no checksum or signature, so a plaintext download is not acceptable.
+# http is allowed only for loopback testing.
+if [ -n "$BUNDLE_URL" ]; then
+	case "$BUNDLE_URL" in
+	https://*) ;;
+	http://127.0.0.1* | http://localhost*) ;;
+	http://*)
+		die "--url must use https:// (http:// is allowed only for 127.0.0.1 or localhost testing)"
+		;;
+	*)
+		die "--url must be an absolute https:// URL"
+		;;
+	esac
+fi
 
 machine="$(uname -m)"
 case "$machine" in
@@ -267,6 +302,12 @@ elif [ "$MODE" = "url" ]; then
 	PROV_EXAMPLE="$fetch_dir/agent.example.json"
 else
 	log "architecture $machine -> $BIN_NAME; fetching the release"
+	# GITHUB_TOKEN is honoured only here, on the private-fork release path. It
+	# is deliberately not consulted for --url, so an ambient token cannot be
+	# attached to a request to an arbitrary host.
+	if [ -z "$TOKEN" ] && [ -n "$ENV_TOKEN" ]; then
+		TOKEN="$ENV_TOKEN"
+	fi
 	prepare_temp
 	fetch_dir="$TMP_DIR/bundle"
 	mkdir -p "$fetch_dir"
@@ -342,7 +383,9 @@ if [ -n "$EXAMPLE_OVERRIDE" ]; then
 fi
 
 log "handing off to provision.sh"
-bash "$PROVISION_PATH" "${provision_args[@]}"
+# </dev/null: under `curl | sudo bash` stdin is the script pipe, and a child
+# that reads stdin (apt/debconf) would otherwise consume the rest of install.sh.
+bash "$PROVISION_PATH" "${provision_args[@]}" </dev/null
 
 printf '\n'
 log "done. If a bearer token was printed above, copy it into the Windows client config (deploy/windows), then run install.ps1. The Pi is provisioned either way."

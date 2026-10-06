@@ -387,6 +387,83 @@ func TestLocalLoginPathForm(t *testing.T) {
 	}
 }
 
+// TestLocalLoginTrailingSlash: a trailing slash is not the path form. It must
+// not issue a binding or consume the code, and the code must still be usable
+// through the exact form afterwards.
+func TestLocalLoginTrailingSlash(t *testing.T) {
+	s, ts := startLocal(t, &fakeBackend{}, nil)
+
+	code := s.codes.Issue()
+	resp := doGET(t, newTestClient(), ts.URL+"/ui/login/"+code+"/")
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("GET /ui/login/<code>/ = 200, want no binding")
+	}
+
+	// The code was not bound or consumed: the exact form still works.
+	owner := newTestClient()
+	ok := doGET(t, owner, ts.URL+"/ui/login/"+code)
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("exact path form after a trailing-slash GET = %d, want 200", ok.StatusCode)
+	}
+}
+
+// TestLocalLoginEncodedSlash: a %2F inside the code segment must not be decoded
+// into a path separator that selects another route, must not match a real code,
+// and must not consume it.
+func TestLocalLoginEncodedSlash(t *testing.T) {
+	s, ts := startLocal(t, &fakeBackend{}, nil)
+
+	code := s.codes.Issue()
+	resp := doGET(t, newTestClient(), ts.URL+"/ui/login/"+code+"%2F")
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("GET /ui/login/<code>%%2F = 200, want no binding")
+	}
+
+	// The real code remains unused and single-use.
+	owner := newTestClient()
+	ok := doGET(t, owner, ts.URL+"/ui/login/"+code)
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("exact path form after an encoded-slash GET = %d, want 200", ok.StatusCode)
+	}
+	redeem := doPOST(t, owner, ts.URL+"/ui/login", url.Values{"code": {code}}, nil)
+	redeem.Body.Close()
+	if redeem.StatusCode != http.StatusSeeOther {
+		t.Fatalf("redemption after an encoded-slash GET = %d, want 303", redeem.StatusCode)
+	}
+}
+
+// TestLocalLoginMixedFormsSingleUse: a code bound through the path form cannot
+// be reused through the query form, or vice versa; single-use spans both.
+func TestLocalLoginMixedFormsSingleUse(t *testing.T) {
+	s, ts := startLocal(t, &fakeBackend{}, nil)
+
+	code := s.codes.Issue()
+	owner := newTestClient()
+
+	// Bind through the path form, redeem through POST, then present the same
+	// code through the query form: it must already be spent.
+	resp := doGET(t, owner, ts.URL+"/ui/login/"+code)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("path issuing GET = %d, want 200", resp.StatusCode)
+	}
+	redeem := doPOST(t, owner, ts.URL+"/ui/login", url.Values{"code": {code}}, nil)
+	redeem.Body.Close()
+	if redeem.StatusCode != http.StatusSeeOther {
+		t.Fatalf("path redemption = %d, want 303", redeem.StatusCode)
+	}
+
+	again := doGET(t, owner, ts.URL+"/ui/login?code="+url.QueryEscape(code))
+	again.Body.Close()
+	if again.StatusCode == http.StatusOK {
+		t.Fatalf("query-form GET of a spent path code = 200, want no binding")
+	}
+}
+
 // TestLocalLoginCookieIsHardened: the binding cookie is HttpOnly and
 // SameSite=Strict.
 func TestLocalLoginCookieIsHardened(t *testing.T) {

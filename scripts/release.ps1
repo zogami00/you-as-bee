@@ -60,6 +60,10 @@ function Write-Info([string]$Message) {
     Write-Host ("  {0}" -f $Message)
 }
 
+function Write-Warn([string]$Message) {
+    Write-Host ("  WARNING: {0}" -f $Message) -ForegroundColor Yellow
+}
+
 function Fail([string]$Message) {
     throw ("release: {0}" -f $Message)
 }
@@ -130,7 +134,8 @@ try {
     Write-Host ''
     Write-Step 'Pi one-liner'
     Write-Host ("  curl -fsSL {0} | sudo bash -s -- --release {1}" -f $installUrl, $Tag)
-    Write-Host '  # Private fork only: add -H "Authorization: Bearer $GITHUB_TOKEN" and --token "$GITHUB_TOKEN".'
+    Write-Host '  # Private fork only: export GITHUB_TOKEN (repo scope) and use "sudo -E bash -s --"'
+    Write-Host '  # instead, so the token stays off the command line.'
     Write-Host ''
     Write-Ok 'release helper complete'
 }

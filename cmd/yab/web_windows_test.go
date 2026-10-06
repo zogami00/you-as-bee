@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -159,21 +160,43 @@ func TestExplorerPathIsAbsolute(t *testing.T) {
 	}
 }
 
-func TestRundll32PathIsAbsolute(t *testing.T) {
-	t.Setenv("SystemRoot", `D:\Windows`)
-	got := rundll32Path()
-	want := filepath.Join(`D:\Windows`, "System32", "rundll32.exe")
-	if got != want {
-		t.Errorf("rundll32Path() = %q, want %q", got, want)
+// TestOpenUILaunchesOnceOnNonZeroExit is the regression test for the browser
+// opening twice: explorer.exe exits 1 even when it successfully hands the URL
+// to the shell, so openUI must treat the exit status as meaningless and launch
+// exactly once. The substituted launcher starts successfully and exits 1,
+// mirroring the real explorer.exe. A fallback launcher would make calls == 2.
+func TestOpenUILaunchesOnceOnNonZeroExit(t *testing.T) {
+	orig := explorerCommand
+	calls := 0
+	explorerCommand = func(string) *exec.Cmd {
+		calls++
+		return exec.Command("cmd.exe", "/c", "exit", "1")
 	}
-	if !filepath.IsAbs(got) {
-		t.Errorf("rundll32Path() = %q, want an absolute path", got)
-	}
+	t.Cleanup(func() { explorerCommand = orig })
 
-	t.Setenv("SystemRoot", "")
-	got = rundll32Path()
-	if !filepath.IsAbs(got) || !strings.HasSuffix(strings.ToLower(got), "rundll32.exe") {
-		t.Errorf("rundll32Path() with an empty SystemRoot = %q, want an absolute path ending in rundll32.exe", got)
+	if err := openUI("http://127.0.0.1:1/ui/login/code"); err != nil {
+		t.Fatalf("openUI with a launcher that exits non-zero = %v, want nil", err)
+	}
+	if calls != 1 {
+		t.Fatalf("openUI launched the browser %d times, want exactly 1", calls)
+	}
+}
+
+// TestOpenUIReportsStartFailure: only a cmd.Start() failure is an error, and it
+// is reported so the tray's existing message can show.
+func TestOpenUIReportsStartFailure(t *testing.T) {
+	orig := explorerCommand
+	explorerCommand = func(string) *exec.Cmd {
+		return exec.Command(filepath.Join(t.TempDir(), "definitely-not-explorer.exe"))
+	}
+	t.Cleanup(func() { explorerCommand = orig })
+
+	err := openUI("http://127.0.0.1:1/ui/login/code")
+	if err == nil {
+		t.Fatal("openUI with a missing launcher = nil, want a start error")
+	}
+	if !strings.Contains(err.Error(), "explorer.exe") {
+		t.Errorf("openUI error = %q, want it to name explorer.exe", err)
 	}
 }
 
