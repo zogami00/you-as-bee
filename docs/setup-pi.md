@@ -121,7 +121,9 @@ an ambient token cannot be sent to an arbitrary host.
 
 `--url` must be an **`https://`** URL, because the bundle's `provision.sh` and
 `yabd` are run as root with no checksum or signature; `http://` is allowed only
-for `127.0.0.1`/`localhost` testing.
+for `127.0.0.1`/`localhost` testing, and there the host must match exactly one
+of those two names or a suffix (`localhost.evil.example`) or userinfo
+(`localhost@evil.example`) would slip past a prefix check.
 
 It is idempotent, because `provision.sh` is: a second run reports `provision: no
 changes` and does not reprint the token.

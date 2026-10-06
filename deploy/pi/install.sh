@@ -172,11 +172,24 @@ done
 
 # A network --url must be https: the bundle's provision.sh and yabd run as root
 # with no checksum or signature, so a plaintext download is not acceptable.
-# http is allowed only for loopback testing.
+# http is allowed only for loopback testing, and then the host must match
+# EXACTLY 127.0.0.1 or localhost: a prefix match would accept
+# localhost.evil.example, and userinfo (localhost@evil.example) makes the
+# parser connect to the attacker's host, not the loopback one.
 if [ -n "$BUNDLE_URL" ]; then
+	# The authority is everything between the scheme and the first "/". A "@"
+	# there is userinfo, so the text before it is not the host.
+	url_authority="${BUNDLE_URL#*://}"
+	url_authority="${url_authority%%/*}"
+	case "$url_authority" in
+	*@*)
+		die "--url must not contain userinfo (user@host): the host would not be the loopback address"
+		;;
+	esac
 	case "$BUNDLE_URL" in
 	https://*) ;;
-	http://127.0.0.1* | http://localhost*) ;;
+	http://localhost | http://localhost/* | http://localhost:*) ;;
+	http://127.0.0.1 | http://127.0.0.1/* | http://127.0.0.1:*) ;;
 	http://*)
 		die "--url must use https:// (http:// is allowed only for 127.0.0.1 or localhost testing)"
 		;;
