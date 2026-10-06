@@ -79,11 +79,14 @@ provisioning logic). Cut a release first with `scripts\release.ps1`, or point it
 at any bundle host.
 
 ```bash
-# From a release asset. The repository is private, so a token is required:
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-  https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
-  | sudo bash -s -- --release v1.0.0 --token "$GITHUB_TOKEN"
+# From a release asset. The repository is public, so no token is needed:
+curl -fsSL https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
+  | sudo bash -s -- --release v1.0.0
 ```
+
+Omit `--release v1.0.0` to install the newest release: the bootstrap resolves
+the latest tag from the public `releases/latest` redirect (no token, no API
+call, no `jq`).
 
 What it does:
 
@@ -99,15 +102,17 @@ What it does:
   on exit.
 - **Passes through** `--client-cidr`, `--no-firewall`, `--binary` and
   `--example` to `provision.sh`.
-- **Never prints the token.** For a private repository the GitHub token is
-  written to a mode-`0600` `curl` config file in the temporary directory, so it
-  does not appear on the command line or in the log.
+- **Never prints a token.** A GitHub token is only used for a private fork; if
+  one is supplied it is written to a mode-`0600` `curl` config file in the
+  temporary directory, so it does not appear on the command line or in the log.
 
-**Private-repo caveat.** GitHub serves a private release only to an
-authenticated request, so `--release` needs `--token <token>` or
-`$GITHUB_TOKEN` with `repo` scope. Without one, the API answers `404` and the
-bootstrap fails with a download error. A public bundle host (`--url`) needs no
-token.
+**Private fork only.** This repository is public, so the normal path needs no
+token: each asset comes from the plain `browser_download_url`
+(`https://github.com/<slug>/releases/download/<tag>/<asset>`) with no API call
+and no `Accept` header. If you fork the repository and keep the fork **private**,
+pass `--token <token>` or set `$GITHUB_TOKEN` with `repo` scope, and the
+bootstrap uses the authenticated GitHub API asset path instead. A public bundle
+host (`--url`) likewise needs no token.
 
 It is idempotent, because `provision.sh` is: a second run reports `provision: no
 changes` and does not reprint the token.

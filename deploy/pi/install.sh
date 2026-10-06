@@ -4,7 +4,7 @@
 #
 # Designed to be piped to a shell:
 #
-#   curl -fsSL <install.sh-url> | sudo bash -s -- --release v1.0.0 --token <token>
+#   curl -fsSL <install.sh-url> | sudo bash -s -- --release v1.0.0
 #
 # It obtains the deployment bundle, then hands off to provision.sh for the
 # actual provisioning. It never duplicates provision.sh: agent.json, the token,
@@ -20,9 +20,13 @@
 #   * a GitHub release (the default when piped): --release <tag>, or the latest
 #     release when no tag is given.
 #
-# The repository is private, so a release download needs a token with "repo"
-# scope: pass --token <token> or set GITHUB_TOKEN. The token is written to a
-# mode-0600 curl config file in a temporary directory and is never printed.
+# The GitHub repository is public, so a release download needs no token: each
+# asset is fetched from the plain browser_download_url
+# (https://github.com/<slug>/releases/download/<tag>/<asset>) with no API call
+# and no Accept header. A token is only needed for a private fork: pass
+# --token <token> or set GITHUB_TOKEN and the script uses the authenticated API
+# asset path instead. The token is written to a mode-0600 curl config file in a
+# temporary directory and is never printed.
 #
 # Usage:
 #   sudo ./install.sh [--url URL | --release [TAG]] [--token TOKEN]
@@ -37,7 +41,9 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
 REPO_SLUG="zogami00/you-as-bee"
-GITHUB_API="https://api.github.com"
+# Overridable for a self-hosted mirror and for offline testing.
+GITHUB_WEB="${YAB_GITHUB_WEB:-https://github.com}"
+GITHUB_API="${YAB_GITHUB_API:-https://api.github.com}"
 
 BUNDLE_URL=""
 RELEASE_TAG=""
@@ -54,7 +60,6 @@ TMP_DIR=""
 AUTH_CFG=""
 
 log() { printf 'install: %s\n' "$*"; }
-warn() { printf 'install: warning: %s\n' "$*" >&2; }
 die() {
 	printf 'install: error: %s\n' "$*" >&2
 	exit 1
@@ -74,9 +79,11 @@ Usage: sudo ./install.sh [options]
   --url URL                     base URL of the bundle (fetch <URL>/provision.sh,
                                 the support files and the yabd binary).
   --release [TAG]               download a GitHub release; TAG defaults to the
-                                latest release.
-  --token TOKEN                 GitHub token for a private release (or set
-                                GITHUB_TOKEN). The token is never printed.
+                                latest release (resolved from the public
+                                releases/latest redirect, no token needed).
+  --token TOKEN                 GitHub token for a PRIVATE FORK only (or set
+                                GITHUB_TOKEN); not needed for this repository.
+                                The token is never printed.
   --client-cidr CIDR[,CIDR...]  passed through to provision.sh.
   --no-firewall                 passed through to provision.sh.
   --binary PATH                 install this yabd binary instead of the bundle's.
@@ -85,7 +92,7 @@ Usage: sudo ./install.sh [options]
   -h, --help                    show this help.
 
 Examples:
-  curl -fsSL <url>/install.sh | sudo bash -s -- --release v1.0.0 --token <token>
+  curl -fsSL <url>/install.sh | sudo bash -s -- --release v1.0.0
   sudo ./install.sh --url https://example.invalid/yab
   sudo ./install.sh --binary ./dist/yabd-linux-arm64 --client-cidr 192.168.1.0/24
 EOF
@@ -197,6 +204,24 @@ fetch() {
 	fi
 }
 
+# resolve_latest_tag prints the tag of the newest release by following the
+# public releases/latest redirect. It needs no token, makes no API call and
+# parses no JSON, so a bare Raspberry Pi OS image (no jq) can run it: curl
+# reports the final URL, from which the tag is the last path segment.
+resolve_latest_tag() {
+	local final
+	final="$(curl -fsSL --retry 2 -o /dev/null -w '%{url_effective}' \
+		"$GITHUB_WEB/$REPO_SLUG/releases/latest" 2>/dev/null)" || return 1
+	case "$final" in
+	*/releases/tag/*)
+		printf '%s\n' "${final##*/releases/tag/}"
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
 local_ok=0
 if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/provision.sh" ]; then
 	if [ -f "$SCRIPT_DIR/$BIN_NAME" ] || [ -f "$SCRIPT_DIR/../../dist/$BIN_NAME" ]; then
@@ -242,23 +267,23 @@ elif [ "$MODE" = "url" ]; then
 	PROV_EXAMPLE="$fetch_dir/agent.example.json"
 else
 	log "architecture $machine -> $BIN_NAME; fetching the release"
-	command -v python3 >/dev/null 2>&1 || die "python3 is required for release downloads"
-	if [ -z "$TOKEN" ]; then
-		warn "no --token/GITHUB_TOKEN given; a private release will not download. Use --token for a private repo."
-	fi
 	prepare_temp
-	json="$TMP_DIR/release.json"
-	if [ -z "$RELEASE_TAG" ] || [ "$RELEASE_TAG" = "latest" ]; then
-		api_url="$GITHUB_API/repos/$REPO_SLUG/releases/latest"
-	else
-		api_url="$GITHUB_API/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG"
-	fi
-	fetch "$api_url" "$json" "application/vnd.github+json"
+	fetch_dir="$TMP_DIR/bundle"
+	mkdir -p "$fetch_dir"
+	if [ -n "$TOKEN" ]; then
+		# Private fork (a token was supplied). The plain browser_download_url
+		# redirects to a signed URL that rejects the bearer token, so keep the
+		# authenticated API asset path (Accept: application/octet-stream).
+		command -v python3 >/dev/null 2>&1 || die "python3 is required for authenticated release downloads"
+		if [ -z "$RELEASE_TAG" ] || [ "$RELEASE_TAG" = "latest" ]; then
+			api_url="$GITHUB_API/repos/$REPO_SLUG/releases/latest"
+		else
+			api_url="$GITHUB_API/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG"
+		fi
+		json="$TMP_DIR/release.json"
+		fetch "$api_url" "$json" "application/vnd.github+json"
 
-	# The API "url" field plus Accept: application/octet-stream is the reliable
-	# way to download an asset from a private repository; browser_download_url
-	# redirects to a signed URL that rejects the bearer token.
-	python3 - "$json" >"$TMP_DIR/assets.txt" <<'PY'
+		python3 - "$json" >"$TMP_DIR/assets.txt" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as fh:
     release = json.load(fh)
@@ -266,17 +291,29 @@ for asset in release.get("assets", []):
     print(asset["name"] + "\t" + asset["url"])
 PY
 
-	find_asset() {
-		awk -F '\t' -v want="$1" '$1 == want { print $2; found = 1 } END { exit found ? 0 : 1 }' "$TMP_DIR/assets.txt"
-	}
+		find_asset() {
+			awk -F '\t' -v want="$1" '$1 == want { print $2; found = 1 } END { exit found ? 0 : 1 }' "$TMP_DIR/assets.txt"
+		}
 
-	fetch_dir="$TMP_DIR/bundle"
-	mkdir -p "$fetch_dir"
-	for name in provision.sh agent.example.json yabd.service usbipd.service yab-modprobe.conf 90-you-as-bee.rules "$BIN_NAME"; do
-		asset_url="$(find_asset "$name")" || die "release does not contain asset: $name"
-		fetch "$asset_url" "$fetch_dir/$name" "application/octet-stream"
-		[ -s "$fetch_dir/$name" ] || die "downloaded empty file: $name"
-	done
+		for name in provision.sh agent.example.json yabd.service usbipd.service yab-modprobe.conf 90-you-as-bee.rules "$BIN_NAME"; do
+			asset_url="$(find_asset "$name")" || die "release does not contain asset: $name"
+			fetch "$asset_url" "$fetch_dir/$name" "application/octet-stream"
+			[ -s "$fetch_dir/$name" ] || die "downloaded empty file: $name"
+		done
+	else
+		# Public repository: no API call, no token, no Accept header. Each
+		# asset comes straight from the plain browser_download_url.
+		if [ -z "$RELEASE_TAG" ] || [ "$RELEASE_TAG" = "latest" ]; then
+			RELEASE_TAG="$(resolve_latest_tag)" || RELEASE_TAG=""
+			[ -n "$RELEASE_TAG" ] || die "could not resolve the latest release tag; pass an explicit tag: --release <tag>"
+		fi
+		log "release $RELEASE_TAG (public download, no token)"
+		base="$GITHUB_WEB/$REPO_SLUG/releases/download/$RELEASE_TAG"
+		for name in provision.sh agent.example.json yabd.service usbipd.service yab-modprobe.conf 90-you-as-bee.rules "$BIN_NAME"; do
+			fetch "$base/$name" "$fetch_dir/$name"
+			[ -s "$fetch_dir/$name" ] || die "downloaded empty file: $name"
+		done
+	fi
 	PROVISION_PATH="$fetch_dir/provision.sh"
 	PROV_BIN="$fetch_dir/$BIN_NAME"
 	PROV_EXAMPLE="$fetch_dir/agent.example.json"

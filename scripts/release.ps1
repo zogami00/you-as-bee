@@ -10,7 +10,8 @@
         deploy/pi/install.sh  curl -fsSL <url> | sudo bash -s -- --release <tag>
 
     It prints the resulting asset URLs and a ready-to-paste curl command. The
-    repository is private, so the printed command includes the token flow.
+    repository is public, so the printed command needs no token; a private fork
+    would add the token flow.
 
     This is a manual helper: it is never invoked by CI or by any other script.
     Run it yourself after `scripts/build.ps1` and after committing the release
@@ -128,8 +129,8 @@ try {
     $installUrl = ("https://github.com/{0}/releases/download/{1}/install.sh" -f $Repo, $Tag)
     Write-Host ''
     Write-Step 'Pi one-liner'
-    Write-Host '  # The repository is private: set GITHUB_TOKEN (repo scope) first.'
-    Write-Host ("  curl -fsSL -H ""Authorization: Bearer `$GITHUB_TOKEN"" {0} | sudo bash -s -- --release {1} --token ""`$GITHUB_TOKEN""" -f $installUrl, $Tag)
+    Write-Host ("  curl -fsSL {0} | sudo bash -s -- --release {1}" -f $installUrl, $Tag)
+    Write-Host '  # Private fork only: add -H "Authorization: Bearer $GITHUB_TOKEN" and --token "$GITHUB_TOKEN".'
     Write-Host ''
     Write-Ok 'release helper complete'
 }

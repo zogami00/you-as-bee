@@ -20,20 +20,24 @@
       * registers a highest-privilege logon Scheduled Task running "yabw.exe
         tray" (the GUI-subsystem build, so logon opens no console window).
 
-    The binaries come from one of three places, in this order of preference:
+    The binaries come from one of four places, in this order of preference:
 
       1. a local bundle: -BundleDir, or the script's own directory when it
          already contains yab.exe and yabw.exe (the default for a packaged
          install);
-      2. a download: -BundleUrl (with an optional -BundleToken bearer);
-      3. the legacy checkout layout: -SourcePath, default
+      2. a GitHub release: -Release <tag> (or 'latest'). The public repository
+         needs no token: assets come from the plain browser_download_url. Pass
+         -BundleToken only for a private fork, which switches to the
+         authenticated API path;
+      3. a generic download: -BundleUrl (with an optional -BundleToken bearer);
+      4. the legacy checkout layout: -SourcePath, default
          ..\..\dist\yab-windows-amd64.exe, with yabw-windows-amd64.exe beside
          it.
 
     Windows PowerShell 5.1 compatible; ASCII only. Supports -WhatIf in every
-    mode. A -WhatIf run still downloads a -BundleUrl to a temporary directory so
-    the URL and the file headers can be validated; it changes nothing on the
-    system.
+    mode. A -WhatIf run still downloads a -BundleUrl/-Release to a temporary
+    directory so the URL and the file headers can be validated; it changes
+    nothing on the system.
 
 .PARAMETER SourcePath
     Path to yab.exe (legacy checkout mode). Defaults to
@@ -51,9 +55,19 @@
     Base URL of a bundle; the installer fetches <url>/yab.exe, <url>/yabw.exe
     and <url>/client.example.json.
 
+.PARAMETER Release
+    GitHub release tag to install from, or 'latest' to resolve the newest
+    release. The public repository needs no token: assets come from the plain
+    browser_download_url. Only with -BundleToken does it use the authenticated
+    API path (private fork).
+
+.PARAMETER Repo
+    owner/repo slug used by -Release. Defaults to zogami00/you-as-bee.
+
 .PARAMETER BundleToken
-    Optional bearer token sent as "Authorization: Bearer <token>" when
-    downloading with -BundleUrl (for a private release host).
+    Optional bearer token. For -BundleUrl it is sent as "Authorization: Bearer
+    <token>" on every download. For -Release it selects the authenticated API
+    path for a PRIVATE FORK; this repository is public and needs no token.
 
 .PARAMETER PiHost
     When set, replaces the first server's host in the written config.
@@ -73,6 +87,7 @@
 
 .EXAMPLE
     .\install.ps1 -PiHost raspberrypi.local -Token 0123... -UsbipArchive .\usbip-win2.zip -UsbipSha256 ABCD...
+    .\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local
     .\install.ps1 -BundleUrl https://example.invalid/yab/ -BundleToken <token>
     .\install.ps1 -WhatIf
 #>
@@ -82,6 +97,8 @@ param(
     [string]$ConfigExample,
     [string]$BundleDir,
     [string]$BundleUrl,
+    [string]$Release,
+    [string]$Repo = 'zogami00/you-as-bee',
     [string]$BundleToken,
     [string]$PiHost,
     [string]$Token,
@@ -91,6 +108,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Origin overrides for a self-hosted mirror and for offline testing.
+$githubWeb = $env:YAB_GITHUB_WEB
+if (-not $githubWeb) { $githubWeb = 'https://github.com' }
+$githubApi = $env:YAB_GITHUB_API
+if (-not $githubApi) { $githubApi = 'https://api.github.com' }
 
 # Shared task helpers: Test-YabTaskExists falls back to schtasks when
 # Get-ScheduledTask throws (see ScheduledTask.ps1).
@@ -176,30 +199,108 @@ function Test-PeFile([string]$Path) {
     return $true
 }
 
-# Get-YabBundleFromUrl fetches the three bundle files into DestDir and validates
-# each one. A non-empty body is required for all three; the two binaries must
-# also be plausible PE files. The bearer token, when present, goes only into the
-# request header and is never written to disk.
+# Get-YabFile downloads Uri to Dest, with an optional bearer token and Accept
+# header. The token goes only into the request header and is never written to
+# disk. It fails on an empty body and, when RequirePe is set, on a body without
+# a valid PE header.
+function Get-YabFile([string]$Uri, [string]$Dest, [string]$Token, [bool]$RequirePe, [string]$Accept) {
+    $headers = @{ 'User-Agent' = 'you-as-bee-install' }
+    if ($Token) { $headers['Authorization'] = ("Bearer {0}" -f $Token) }
+    if ($Accept) { $headers['Accept'] = $Accept }
+    try {
+        Invoke-WebRequest -Uri $Uri -OutFile $Dest -Headers $headers -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Fail ("download failed: {0}: {1}" -f $Uri, $_.Exception.Message)
+    }
+    if (-not (Test-Path -LiteralPath $Dest) -or (Get-Item -LiteralPath $Dest).Length -eq 0) {
+        Fail ("downloaded file is empty: {0}" -f $Uri)
+    }
+    if ($RequirePe -and -not (Test-PeFile $Dest)) {
+        Fail ("downloaded file is not a Windows PE binary (an HTML error page?): {0}" -f $Uri)
+    }
+    Write-Ok ("fetched {0}" -f (Split-Path -Leaf $Dest))
+}
+
+# Get-YabBundleFromUrl fetches the three bundle files into DestDir from a
+# generic base URL (-BundleUrl). A non-empty body is required for all three;
+# the two binaries must also be plausible PE files.
 function Get-YabBundleFromUrl([string]$Url, [string]$Token, [string]$DestDir) {
     $base = $Url.TrimEnd('/')
-    $names = @('yab.exe', 'yabw.exe', 'client.example.json')
-    foreach ($name in $names) {
-        $uri = ("{0}/{1}" -f $base, $name)
-        $dest = Join-Path $DestDir $name
-        $headers = @{ 'User-Agent' = 'you-as-bee-install' }
-        if ($Token) { $headers['Authorization'] = ("Bearer {0}" -f $Token) }
-        try {
-            Invoke-WebRequest -Uri $uri -OutFile $dest -Headers $headers -UseBasicParsing -ErrorAction Stop
-        } catch {
-            Fail ("download failed: {0}: {1}" -f $uri, $_.Exception.Message)
+    Get-YabFile -Uri ("{0}/yab.exe" -f $base)  -Dest (Join-Path $DestDir 'yab.exe')  -Token $Token -RequirePe $true -Accept ''
+    Get-YabFile -Uri ("{0}/yabw.exe" -f $base) -Dest (Join-Path $DestDir 'yabw.exe') -Token $Token -RequirePe $true -Accept ''
+    Get-YabFile -Uri ("{0}/client.example.json" -f $base) -Dest (Join-Path $DestDir 'client.example.json') -Token $Token -RequirePe $false -Accept ''
+}
+
+# Resolve-YabLatestTag returns the newest release tag for RepoSlug by reading
+# the public releases.atom feed (no token, no API call). The feed lists entries
+# newest first and each entry links to /releases/tag/<tag>.
+function Resolve-YabLatestTag([string]$RepoSlug) {
+    $feedUrl = ("{0}/{1}/releases.atom" -f $githubWeb, $RepoSlug)
+    try {
+        $resp = Invoke-WebRequest -Uri $feedUrl -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Fail ("could not resolve the latest release for {0}: {1}; pass an explicit -Release <tag>" -f $RepoSlug, $_.Exception.Message)
+    }
+    try {
+        [xml]$feed = $resp.Content
+    } catch {
+        Fail ("could not parse the release feed from {0}; pass an explicit -Release <tag>" -f $feedUrl)
+    }
+    $entry = @($feed.feed.entry)[0]
+    if (-not $entry) {
+        Fail ("{0} has no releases; pass an explicit -Release <tag>" -f $RepoSlug)
+    }
+    foreach ($link in @($entry.link)) {
+        if ($link.href -and ($link.href -match '/releases/tag/([^/]+)$')) {
+            return $Matches[1]
         }
-        if (-not (Test-Path -LiteralPath $dest) -or (Get-Item -LiteralPath $dest).Length -eq 0) {
-            Fail ("downloaded file is empty: {0}" -f $uri)
+    }
+    Fail ("could not find a tag in the release feed for {0}" -f $RepoSlug)
+}
+
+# Get-YabReleaseFromPublic downloads the release assets from the plain public
+# browser_download_url (https://<host>/<repo>/releases/download/<tag>/...): no
+# token, no API call, no Accept header.
+function Get-YabReleaseFromPublic([string]$RepoSlug, [string]$Tag, [string]$DestDir) {
+    $base = ("{0}/{1}/releases/download/{2}" -f $githubWeb, $RepoSlug, $Tag)
+    Get-YabFile -Uri ("{0}/yab-windows-amd64.exe" -f $base)  -Dest (Join-Path $DestDir 'yab.exe')  -Token '' -RequirePe $true -Accept ''
+    Get-YabFile -Uri ("{0}/yabw-windows-amd64.exe" -f $base) -Dest (Join-Path $DestDir 'yabw.exe') -Token '' -RequirePe $true -Accept ''
+    Get-YabFile -Uri ("{0}/client.example.json" -f $base)    -Dest (Join-Path $DestDir 'client.example.json') -Token '' -RequirePe $false -Accept ''
+}
+
+# Get-YabReleaseFromApi is the PRIVATE FORK path, used only when -BundleToken is
+# supplied: it lists the release through the authenticated API and downloads
+# each asset by its API URL with Accept: application/octet-stream (the
+# browser_download_url redirect rejects a bearer token).
+function Get-YabReleaseFromApi([string]$RepoSlug, [string]$Tag, [string]$Token, [string]$DestDir) {
+    if ($Tag -and $Tag -ne 'latest') {
+        $apiUrl = ("{0}/repos/{1}/releases/tags/{2}" -f $githubApi, $RepoSlug, $Tag)
+    } else {
+        $apiUrl = ("{0}/repos/{1}/releases/latest" -f $githubApi, $RepoSlug)
+    }
+    $headers = @{
+        'User-Agent'    = 'you-as-bee-install'
+        'Accept'        = 'application/vnd.github+json'
+        'Authorization' = ("Bearer {0}" -f $Token)
+    }
+    try {
+        $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
+    } catch {
+        Fail ("release lookup failed: {0}: {1}" -f $apiUrl, $_.Exception.Message)
+    }
+    $assets = @{}
+    foreach ($a in @($release.assets)) { $assets[$a.name] = $a.url }
+    $map = @(
+        @{ Asset = 'yab-windows-amd64.exe';  Dest = 'yab.exe';           RequirePe = $true },
+        @{ Asset = 'yabw-windows-amd64.exe'; Dest = 'yabw.exe';          RequirePe = $true },
+        @{ Asset = 'client.example.json';    Dest = 'client.example.json'; RequirePe = $false }
+    )
+    foreach ($m in $map) {
+        if (-not $assets.ContainsKey($m.Asset)) {
+            Fail ("release does not contain asset: {0}" -f $m.Asset)
         }
-        if ($name -ne 'client.example.json' -and -not (Test-PeFile $dest)) {
-            Fail ("downloaded file is not a Windows PE binary (an HTML error page?): {0}" -f $uri)
-        }
-        Write-Ok ("fetched {0}" -f $name)
+        Get-YabFile -Uri $assets[$m.Asset] -Dest (Join-Path $DestDir $m.Dest) `
+            -Token $Token -RequirePe $m.RequirePe -Accept 'application/octet-stream'
     }
 }
 
@@ -236,6 +337,10 @@ try {
     $explicitConfig = $PSBoundParameters.ContainsKey('ConfigExample')
     $explicitBundleDir = $PSBoundParameters.ContainsKey('BundleDir')
 
+    if ($BundleUrl -and $Release) {
+        Fail '-BundleUrl and -Release are mutually exclusive.'
+    }
+
     $SourceW = $null
 
     if ($BundleUrl) {
@@ -247,6 +352,21 @@ try {
         [void][System.IO.Directory]::CreateDirectory($bundleTemp)
         Write-Info ("downloading bundle from {0}" -f $BundleUrl)
         Get-YabBundleFromUrl -Url $BundleUrl -Token $BundleToken -DestDir $bundleTemp
+        $SourcePath = Join-Path $bundleTemp 'yab.exe'
+        $SourceW = Join-Path $bundleTemp 'yabw.exe'
+        if (-not $explicitConfig) { $ConfigExample = Join-Path $bundleTemp 'client.example.json' }
+    } elseif ($Release) {
+        $bundleTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("you-as-bee-bundle-" + [Guid]::NewGuid().ToString('N'))
+        [void][System.IO.Directory]::CreateDirectory($bundleTemp)
+        if ($BundleToken) {
+            Write-Info ("downloading release {0} for {1} (authenticated API; private fork)" -f $Release, $Repo)
+            Get-YabReleaseFromApi -RepoSlug $Repo -Tag $Release -Token $BundleToken -DestDir $bundleTemp
+        } else {
+            $tag = $Release
+            if (-not $tag -or $tag -eq 'latest') { $tag = Resolve-YabLatestTag $Repo }
+            Write-Info ("downloading release {0} for {1} (public download, no token)" -f $tag, $Repo)
+            Get-YabReleaseFromPublic -RepoSlug $Repo -Tag $tag -DestDir $bundleTemp
+        }
         $SourcePath = Join-Path $bundleTemp 'yab.exe'
         $SourceW = Join-Path $bundleTemp 'yabw.exe'
         if (-not $explicitConfig) { $ConfigExample = Join-Path $bundleTemp 'client.example.json' }
@@ -274,11 +394,11 @@ try {
     }
 
     if (-not (Test-Path -LiteralPath $SourcePath)) {
-        Fail ("yab.exe not found: {0} (build it with scripts\build.ps1, or use -BundleDir/-BundleUrl)" -f $SourcePath)
+        Fail ("yab.exe not found: {0} (build it with scripts\build.ps1, or use -BundleDir/-BundleUrl/-Release)" -f $SourcePath)
     }
     $SourcePath = (Resolve-Path -LiteralPath $SourcePath).Path
     if (-not (Test-Path -LiteralPath $SourceW)) {
-        Fail ("yabw.exe not found: {0} (build it with scripts\build.ps1, or use -BundleDir/-BundleUrl)" -f $SourceW)
+        Fail ("yabw.exe not found: {0} (build it with scripts\build.ps1, or use -BundleDir/-BundleUrl/-Release)" -f $SourceW)
     }
     $SourceW = (Resolve-Path -LiteralPath $SourceW).Path
 

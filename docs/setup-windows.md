@@ -64,6 +64,17 @@ cd deploy\windows
 .\install.ps1 -PiHost raspberrypi.local -Token <the 64-hex token printed by provision.sh>
 ```
 
+Or install directly from a released bundle, with no checkout:
+
+```powershell
+cd deploy\windows
+.\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local -Token <the 64-hex token>
+```
+
+`-Release` accepts a tag or `latest` and needs **no token**: the repository is
+public, so the assets come from the plain release download URL. (`-BundleToken`
+is only for a private fork.)
+
 `install.ps1`:
 
 - reports whether `usbip.exe` was found and its version;
@@ -102,29 +113,42 @@ To migrate an existing install whose task still runs `yab.exe`, re-run
 `install.ps1 -Force` (the task name is unchanged, so a plain re-run keeps the
 old action).
 
+The Go subcommand `yab install` matches `install.ps1`: it copies **both**
+`yab.exe` and `yabw.exe` into `%ProgramFiles%\you-as-bee\`, stops both process
+names, and registers the logon task against `yabw.exe tray`. If `yabw.exe` is
+not beside the `yab.exe` you run `yab install` from, it fails with a message
+naming the missing file rather than registering a console-launching task.
+`yab uninstall` stops and removes both.
+
 ### Installer source modes
 
-`install.ps1` can get the binaries from three places, in this order of
+`install.ps1` can get the binaries from four places, in this order of
 preference:
 
 1. **Local bundle** (default): `-BundleDir <dir>`, or the script's own
    directory when it already contains `yab.exe` and `yabw.exe`. This is what a
    packaged release looks like - no checkout, no `dist\` layout.
-2. **Download**: `-BundleUrl <base-url>` fetches `<base-url>/yab.exe`,
+2. **GitHub release**: `-Release <tag>` (or `latest`). The public repository
+   needs no token, so assets come from the plain release download URL
+   (`https://github.com/<repo>/releases/download/<tag>/<asset>`). A private fork
+   passes `-BundleToken <token>`, which switches to the authenticated GitHub API
+   asset path; the token is sent only as a request header and is never written
+   to disk.
+3. **Generic download**: `-BundleUrl <base-url>` fetches `<base-url>/yab.exe`,
    `<base-url>/yabw.exe` and `<base-url>/client.example.json` to a temporary
    directory. For a private host pass `-BundleToken <token>`; the token is sent
-   as `Authorization: Bearer <token>` and is never written to disk. Every
-   download must be non-empty and each binary must have a valid PE header
-   (`MZ` plus a `PE\0\0` signature), so an HTML error page saved as `yab.exe`
-   is rejected before anything reaches `%ProgramFiles%`.
-3. **Legacy checkout layout**: `-SourcePath` (default
+   as `Authorization: Bearer <token>`. Every download must be non-empty and each
+   binary must have a valid PE header (`MZ` plus a `PE\0\0` signature), so an
+   HTML error page saved as `yab.exe` is rejected before anything reaches
+   `%ProgramFiles%`.
+4. **Legacy checkout layout**: `-SourcePath` (default
    `..\..\dist\yab-windows-amd64.exe`), with `yabw-windows-amd64.exe` expected
    beside it. This preserves the previous behaviour for a working copy.
 
-`-WhatIf` works in all three modes. In download mode it still fetches the
-bundle into a temporary directory (so the URL and the file headers are
-validated) but changes nothing on the system; the temporary directory is always
-removed.
+`-WhatIf` works in all four modes. In release and download modes it still
+fetches the bundle into a temporary directory (so the URL and the file headers
+are validated) but changes nothing on the system; the temporary directory is
+always removed.
 
 `%ProgramData%\you-as-bee` is restricted to Administrators and SYSTEM because
 `client.json` holds the bearer token. Every `yab` command reads that file, so

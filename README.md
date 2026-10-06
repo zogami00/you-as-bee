@@ -20,17 +20,17 @@ real local USB devices and can use controllers connected through the Pi.
 
 ## Install
 
-**Pi.** From the released bundle in one line (the repository is private, so a
-token with `repo` scope is required; see [setup-pi.md](docs/setup-pi.md)):
+**Pi.** From the released bundle in one line (the repository is public, so no
+token is needed; see [setup-pi.md](docs/setup-pi.md)):
 
 ```bash
-curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
-  https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
-  | sudo bash -s -- --release v1.0.0 --token "$GITHUB_TOKEN"
+curl -fsSL https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
+  | sudo bash -s -- --release v1.0.0
 ```
 
-Or from a checkout: `scripts\deploy-pi.ps1` over SSH, or copy `deploy/pi` and
-run `sudo ./provision.sh`.
+Omit `--release v1.0.0` to install the newest release (resolved without a
+token). Or from a checkout: `scripts\deploy-pi.ps1` over SSH, or copy
+`deploy/pi` and run `sudo ./provision.sh`.
 
 **Windows.** From an elevated PowerShell, with both `yab.exe` and `yabw.exe`
 next to the script (a packaged bundle) or built into `dist\`:
@@ -40,11 +40,20 @@ cd deploy\windows
 .\install.ps1 -PiHost raspberrypi.local -Token <the 64-hex token printed by provision.sh>
 ```
 
-`install.ps1` also accepts `-BundleDir`, `-BundleUrl`/`-BundleToken` and the
-legacy `-SourcePath`, and supports `-WhatIf` in every mode. It registers the
-logon task against **`yabw.exe`**, the windowless (GUI-subsystem) build of
-`cmd/yab`, so the tray starts at logon without a console window; `yab.exe`
-stays the console CLI. See [setup-windows.md](docs/setup-windows.md).
+or, from a release with no checkout (no download token needed):
+
+```powershell
+.\install.ps1 -Release v1.0.0 -PiHost raspberrypi.local -Token <the 64-hex token>
+```
+
+`install.ps1` also accepts `-BundleDir`, `-BundleUrl`, `-Release` and the
+legacy `-SourcePath`, and supports `-WhatIf` in every mode; the public download
+path needs no token (`-BundleToken` is only for a private fork). Both
+`install.ps1` and the Go `yab install` command copy **both** `yab.exe` and
+`yabw.exe` and register the logon task against **`yabw.exe`**, the windowless
+(GUI-subsystem) build of `cmd/yab`, so the tray starts at logon without a
+console window; `yab.exe` stays the console CLI. See
+[setup-windows.md](docs/setup-windows.md).
 
 Read [security.md](docs/security.md) before exposing anything: the management
 API has a token and an allowlist but **no TLS**, and USB/IP on 3240 is
@@ -123,7 +132,7 @@ yab attach <device> | --all    attach (requires elevation)
 yab detach <device> | --all    detach (requires elevation)
 yab status                     servers, reachability and attached ports
 yab doctor                     usbip, driver, elevation, Secure Boot, agents
-yab install | uninstall        copy to %ProgramFiles%, ACL, logon task
+yab install | uninstall        copy yab.exe+yabw.exe to %ProgramFiles%, ACL, windowless logon task
 ```
 
 `yab tray` also serves a **local browser UI** (loopback only, on by default).
