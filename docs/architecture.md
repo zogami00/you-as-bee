@@ -82,6 +82,35 @@ current `yab` always attaches with `--once` it starts no retries of its own, so
 in normal operation the call is a no-op; the side effect only bites when another
 usbip-win2 user or an older `yab` left a retry running.
 
+## Windows local web UI
+
+`yab tray` can serve the same embedded shell (`internal/webui/assets`) from a
+loopback-only HTTP server (`internal/webui/local.go`). It is a small controller,
+not a second supervisor:
+
+- It binds `127.0.0.1` only; the Host header must equal the exact address it is
+  serving on, which blocks DNS rebinding. It never answers a CORS preflight and
+  refuses cross-origin requests.
+- The browser authenticates with a **one-time code** the tray mints and opens in
+  the default browser through `explorer.exe` (so the browser starts
+  de-elevated). The code is single-use, expires after 60 seconds and is bound to
+  the browser that loaded it; redeeming it (a `303`) sets an
+  `HttpOnly; SameSite=Strict` session cookie and leaves the code out of the URL.
+  Session writes require `X-YAB-CSRF: 1`.
+- **The browser never sees a Pi token.** The local server's payload types carry
+  no credential; `Attach`/`Detach` are forwarded in-process to the same
+  supervisor methods the tray menu calls, so the loopback server talks to the Pi
+  with the token from `client.json` and the browser only ever holds a local
+  session cookie. There is a test asserting the adapter cannot marshal the
+  token.
+- State is `Status()` (pins) plus a server/reachability view cached for up to
+  30 seconds, so a page load cannot trigger repeated probing. The SSE endpoint
+  compares `Status()` against the previous snapshot once a second and emits only
+  on change, rather than hooking the manager, so no transition is missed.
+
+Disabling `web_ui.enabled` does not weaken the Pi-side API: the agent's own
+`/v1` surface and its optional browser UI are unchanged.
+
 ## Management API role
 
 The API is control plane only. It reports device state and records intent

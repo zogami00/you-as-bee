@@ -24,6 +24,7 @@ import (
 	"github.com/zogami00/you-as-bee/internal/execx"
 	"github.com/zogami00/you-as-bee/internal/usbipwin"
 	"github.com/zogami00/you-as-bee/internal/version"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 func main() {
@@ -134,13 +135,19 @@ func locateTool(cfg config.ClientConfig) (*usbipwin.Tool, error) {
 // newManager builds the supervisor. When tool is nil a no-op USBIP is used so
 // commands such as `status` still work without usbip.exe installed.
 func newManager(cfg config.ClientConfig, tool *usbipwin.Tool) (*client.Manager, error) {
+	logger, _, err := newLogger(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newManagerWith(cfg, tool, logger)
+}
+
+// newManagerWith builds the supervisor with a caller-supplied logger, so the
+// tray can share one logger (and its log ring) with the local web UI.
+func newManagerWith(cfg config.ClientConfig, tool *usbipwin.Tool, logger *slog.Logger) (*client.Manager, error) {
 	var u client.USBIP = noopUSBIP{}
 	if tool != nil {
 		u = tool
-	}
-	logger, err := newLogger(cfg)
-	if err != nil {
-		return nil, err
 	}
 	return client.New(client.Options{
 		Config: cfg,
@@ -150,10 +157,12 @@ func newManager(cfg config.ClientConfig, tool *usbipwin.Tool) (*client.Manager, 
 	})
 }
 
-// newLogger builds the client logger. log_file empty means discard; otherwise
-// the file is opened in append mode so a long-running tray keeps its history.
-// log_level selects the minimum level.
-func newLogger(cfg config.ClientConfig) (*slog.Logger, error) {
+// newLogger builds the client logger and returns the in-memory ring the local
+// web UI serves at /ui/api/logs. log_file empty means records still go to the
+// ring and are otherwise discarded; otherwise the file is opened in append mode
+// so a long-running tray keeps its history. log_level selects the minimum
+// level.
+func newLogger(cfg config.ClientConfig) (*slog.Logger, *webui.LogRing, error) {
 	level := slog.LevelInfo
 	switch strings.ToLower(strings.TrimSpace(cfg.LogLevel)) {
 	case "debug":
@@ -164,14 +173,19 @@ func newLogger(cfg config.ClientConfig) (*slog.Logger, error) {
 		level = slog.LevelError
 	}
 	opts := &slog.HandlerOptions{Level: level}
-	if strings.TrimSpace(cfg.LogFile) == "" {
-		return slog.New(slog.NewTextHandler(io.Discard, opts)), nil
+	ring := webui.NewLogRing()
+
+	output := io.Writer(io.Discard)
+	if strings.TrimSpace(cfg.LogFile) != "" {
+		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open log_file: %w", err)
+		}
+		output = f
 	}
-	f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open log_file: %w", err)
-	}
-	return slog.New(slog.NewTextHandler(f, opts)), nil
+	// Fan out to the console/file handler and the ring so GET /ui/api/logs sees
+	// exactly what the client logs.
+	return slog.New(slog.NewMultiHandler(slog.NewTextHandler(output, opts), ring)), ring, nil
 }
 
 // requireElevated prints the required message and returns false when the

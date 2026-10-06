@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/zogami00/you-as-bee/internal/client"
 	"github.com/zogami00/you-as-bee/internal/elevate"
 	"github.com/zogami00/you-as-bee/internal/tray"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 // cmdTray runs the supervisor and the system-tray UI together.
@@ -32,7 +34,12 @@ func cmdTray(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "yab tray: %v\n", err)
 		return 1
 	}
-	m, err := newManager(cfg, tool)
+	logger, logRing, err := newLogger(cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "yab tray: %v\n", err)
+		return 1
+	}
+	m, err := newManagerWith(cfg, tool, logger)
 	if err != nil {
 		fmt.Fprintf(stderr, "yab tray: %v\n", err)
 		return 1
@@ -43,9 +50,23 @@ func cmdTray(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithCancel(baseCtx)
 	defer cancel()
 
+	tc := &trayController{m: m, cancel: cancel, log: logger}
+
+	// Start the local UI before the tray so the menu item always has somewhere
+	// to point. A failure is not fatal: the tray keeps supervising.
+	if cfg.WebUI.Enabled {
+		if ws, werr := startLocalWebUI(cfg, newWebBackend(tc, m), logRing, logger); werr != nil {
+			logger.Warn("web UI did not start", "err", werr)
+		} else {
+			tc.web = ws
+		}
+	} else {
+		logger.Info("web UI disabled by config")
+	}
+
 	go func() { _ = m.Run(ctx) }()
 
-	tray.Run(ctx, &trayController{m: m, cancel: cancel})
+	tray.Run(ctx, tc)
 	return 0
 }
 
@@ -53,6 +74,9 @@ func cmdTray(args []string, stdout, stderr io.Writer) int {
 type trayController struct {
 	m      *client.Manager
 	cancel context.CancelFunc
+	// web is the local UI, nil when it is disabled or failed to start.
+	web *webui.LocalServer
+	log *slog.Logger
 }
 
 func (t *trayController) Devices() []tray.Device {

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/proto"
@@ -54,6 +55,8 @@ type fakeBinder struct {
 	unbinds    int
 	failBind   bool
 	failUnbind bool
+	// bindErr, when set, is returned by Bind instead of the generic failure.
+	bindErr error
 
 	// bindEntered is closed when a bind starts and bindRelease gates its
 	// completion, so a test can hold a bind in flight.
@@ -71,6 +74,9 @@ func (b *fakeBinder) Bind(_ context.Context, dev sysfs.Device, _ usbiphost.Optio
 		<-b.bindRelease
 	}
 	if b.failBind {
+		if b.bindErr != nil {
+			return b.bindErr
+		}
 		return errors.New("bind failed")
 	}
 	b.src.setDriver(dev.BusID, "usbip-host", 1)
@@ -438,7 +444,7 @@ func TestJitterStaysWithinCap(t *testing.T) {
 	r.Rand = func() float64 { return 1 } // maximum upward jitter
 	rec := &record{backoff: maxBackoff}
 	r.mu.Lock()
-	r.failLocked("bt", rec, now)
+	r.failLocked("bt", rec, now, nil)
 	r.mu.Unlock()
 	if got := rec.nextAttempt.Sub(now); got > maxBackoff {
 		t.Errorf("delay with max jitter = %s, want <= %s", got, maxBackoff)
@@ -447,7 +453,7 @@ func TestJitterStaysWithinCap(t *testing.T) {
 	r.Rand = func() float64 { return 0 } // maximum downward jitter
 	rec = &record{backoff: maxBackoff}
 	r.mu.Lock()
-	r.failLocked("bt", rec, now)
+	r.failLocked("bt", rec, now, nil)
 	r.mu.Unlock()
 	minDelay := time.Duration(float64(maxBackoff) * (1 - jitterFraction))
 	if got := rec.nextAttempt.Sub(now); got < minDelay {
@@ -752,5 +758,196 @@ func TestConcurrentReconcileIsSerialized(t *testing.T) {
 
 	if binder.binds != 1 {
 		t.Errorf("binds = %d, want 1: concurrent passes double-bound the device", binder.binds)
+	}
+}
+
+// TestLastErrorSetAndClearedOnSuccess: a failed bind records its error on the
+// device and a later successful bind clears it.
+func TestLastErrorSetAndClearedOnSuccess(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src, failBind: true, bindErr: errors.New("usbip-host bind: permission denied")}
+	r, clock := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	devs := r.Devices(ctx)
+	if len(devs) != 1 || devs[0].LastError == "" {
+		t.Fatalf("LastError not set after a failed bind: %+v", devs)
+	}
+
+	binder.failBind = false
+	r.mu.Lock()
+	next := r.rec["bt"].nextAttempt
+	r.mu.Unlock()
+	clock.set(next)
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if r.State("bt") != Exported {
+		t.Fatalf("state = %s, want exported", r.State("bt"))
+	}
+	if got := r.Devices(ctx)[0].LastError; got != "" {
+		t.Errorf("LastError = %q after a successful bind, want empty", got)
+	}
+}
+
+// TestResetClearsLastError: an explicit reset clears the recorded failure.
+func TestResetClearsLastError(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src, failBind: true, bindErr: errors.New("boom")}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if r.Devices(ctx)[0].LastError == "" {
+		t.Fatal("LastError not set")
+	}
+	if err := r.Reset(ctx, "bt"); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+	r.mu.Lock()
+	got := r.rec["bt"].lastErr
+	r.mu.Unlock()
+	if got != "" {
+		t.Errorf("record lastErr = %q after reset, want empty", got)
+	}
+}
+
+// TestLastErrorOnlyChangeRaisesStateChanged: when the state is unchanged but the
+// failure message changes, the UI must still be told. The Windows supervisor
+// ignores state_changed, so this cannot disturb it.
+func TestLastErrorOnlyChangeRaisesStateChanged(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src, failBind: true, bindErr: errors.New("first failure")}
+	r, clock := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if got := r.Devices(ctx)[0].LastError; got != "first failure" {
+		t.Fatalf("LastError = %q, want first failure", got)
+	}
+
+	ch, cancel := r.Subscribe(ctx)
+	defer cancel()
+
+	binder.bindErr = errors.New("second failure")
+	r.mu.Lock()
+	next := r.rec["bt"].nextAttempt
+	r.mu.Unlock()
+	clock.set(next)
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+
+	select {
+	case ev := <-ch:
+		if ev.Type != proto.EventStateChanged {
+			t.Fatalf("event type = %q, want state_changed", ev.Type)
+		}
+		if ev.Device.LastError != "second failure" {
+			t.Errorf("event device LastError = %q, want second failure", ev.Device.LastError)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no state_changed event was raised for a LastError change")
+	}
+}
+
+// TestLastErrorRedactsFilesystemPaths: LastError is exposed through the API,
+// SSE and the UI, so a sysfs path in the underlying error must not survive.
+func TestLastErrorRedactsFilesystemPaths(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{
+		src:      src,
+		failBind: true,
+		bindErr:  errors.New("usbiphost: write /sys/bus/usb/drivers/usbip-host/bind: permission denied"),
+	}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := r.Devices(ctx)[0].LastError
+	if got == "" {
+		t.Fatal("LastError empty, want a short safe reason")
+	}
+	if strings.Contains(got, "/") {
+		t.Errorf("LastError leaked a filesystem path: %q", got)
+	}
+}
+
+// TestSafeReasonRedactsPathsAnywhere covers the shapes the old first-field
+// heuristic missed: a quoted, parenthesised or '='-delimited path that does not
+// begin a whitespace-delimited field.
+func TestSafeReasonRedactsPathsAnywhere(t *testing.T) {
+	leaky := []string{
+		`usbiphost: open "/sys/bus/usb/devices/1-1.2/idVendor": permission denied`,
+		`write failed (/sys/bus/usb/drivers/usbip-host/bind)`,
+		`path=/sys/bus/usb/devices/1-1.2`,
+		`/sys/bus/usb/devices/1-1.2`,
+	}
+	for _, msg := range leaky {
+		if got := safeReason(msg); strings.Contains(got, "/") {
+			t.Errorf("safeReason(%q) = %q, leaked a path", msg, got)
+		}
+	}
+}
+
+// TestSafeReasonKeepsShortPathFreeMessages: an ordinary error keeps its useful
+// text, and a slash used as a conjunction is not treated as a path.
+func TestSafeReasonKeepsShortPathFreeMessages(t *testing.T) {
+	for _, msg := range []string{"permission denied", "read/write failed", "and/or"} {
+		if got := safeReason(msg); got != msg {
+			t.Errorf("safeReason(%q) = %q, want the message preserved", msg, got)
+		}
+	}
+}
+
+// TestSafeReasonTruncatesOnRuneBoundary: the 200-byte cap must not split a
+// multi-byte rune.
+func TestSafeReasonTruncatesOnRuneBoundary(t *testing.T) {
+	msg := strings.Repeat("\u20ac", 100) // 300 bytes, so a 200-byte cut is mid-rune
+	got := safeReason(msg)
+	if !utf8.ValidString(got) {
+		t.Fatalf("safeReason produced invalid UTF-8 (len %d)", len(got))
+	}
+	if len(got) > 200 {
+		t.Fatalf("safeReason len = %d, want <= 200", len(got))
+	}
+	if len(got) == 0 {
+		t.Fatal("safeReason returned empty")
+	}
+}
+
+// TestAbsentDeviceClearsLastError: an unplugged device must not keep reporting
+// a stale failure.
+func TestAbsentDeviceClearsLastError(t *testing.T) {
+	src := newFakeSource(btDevice())
+	binder := &fakeBinder{src: src, failBind: true, bindErr: errors.New("boom")}
+	r, _ := newTestReconciler(t, src, binder)
+	ctx := context.Background()
+
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	if r.Devices(ctx)[0].LastError == "" {
+		t.Fatal("LastError not set after a failed bind")
+	}
+
+	src.set() // the device is gone
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if got := r.Devices(ctx)[0].LastError; got != "" {
+		t.Errorf("LastError = %q after the device went absent, want empty", got)
+	}
+	if st := r.Devices(ctx)[0].State; st != proto.StateAbsent {
+		t.Errorf("state = %q, want absent", st)
 	}
 }

@@ -97,6 +97,12 @@ yab doctor                     usbip, driver, elevation, Secure Boot, agents
 yab install | uninstall        copy to %ProgramFiles%, ACL, logon task
 ```
 
+`yab tray` also serves a **local browser UI** (loopback only, on by default).
+Open it from the tray menu: **Open web UI**. It shows each pin's state with
+Attach/Detach buttons, server reachability and the recent client log, and the
+browser never receives the Pi token. See
+[setup-windows.md](docs/setup-windows.md).
+
 `yab doctor` only reports; it never changes test signing, Secure Boot or the
 driver.
 

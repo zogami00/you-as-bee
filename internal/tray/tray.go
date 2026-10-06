@@ -37,6 +37,8 @@ type Controller interface {
 	Elevated() bool
 	// RestartElevated relaunches the process through UAC.
 	RestartElevated() error
+	// OpenUI opens the local web UI in the user's default browser, de-elevated.
+	OpenUI() error
 }
 
 // Run renders the tray until ctx is cancelled. On platforms without a tray

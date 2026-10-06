@@ -60,6 +60,10 @@ type AgentConfig struct {
 	Devices        []DeviceConfig `json:"devices"`
 	LogLevel       string         `json:"log_level"`
 	LogFormat      string         `json:"log_format"`
+	// WebUI enables the embedded browser UI and its session-cookie auth
+	// (/ui/...). It is opt-in and defaults to false so upgrading does not
+	// widen anyone's attack surface. See docs/configuration.md.
+	WebUI bool `json:"web_ui"`
 }
 
 // DefaultAllowedClients is the private-address CIDR allowlist used when none is
@@ -87,6 +91,9 @@ func (c *AgentConfig) setDefaults() {
 	c.USBIP.UsbipdBin = "/usr/sbin/usbipd"
 	c.LogLevel = "info"
 	c.LogFormat = "text"
+	// WebUI is false by default; an explicit "web_ui": true in the file wins
+	// because defaults are applied before the document is decoded.
+	c.WebUI = false
 }
 
 // Validate checks the agent configuration and normalises VID/PID case and

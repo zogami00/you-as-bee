@@ -118,6 +118,22 @@ afterwards, apply it by hand:
 sudo systemctl restart yabd
 ```
 
+### Upgrade ordering and rollback
+
+The config loader is strict (`DisallowUnknownFields`), so a binary only accepts
+fields it knows about. The shipped `agent.example.json` contains `web_ui`, so
+any `agent.json` created by this version of `provision.sh` carries it, and an
+**older** `yabd` that predates `web_ui` will reject the config as an unknown
+field and crash-loop under systemd.
+
+Practical rule: upgrade the binary and the support files together. If you must
+roll the binary back to a version older than the one that introduced `web_ui`,
+delete the `"web_ui"` line from `/etc/you-as-bee/agent.json` first (the format
+is strict JSON, so it cannot be commented out), or keep the newer binary.
+`provision.sh` only ever adds keys, it never removes them, so a config written
+once by a newer version stays incompatible with an older binary until that key
+is deleted.
+
 ### Why btusb is blacklisted
 
 `yab-modprobe.conf` blacklists `btusb` and `xone` so they do not claim the

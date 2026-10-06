@@ -13,8 +13,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/identity"
@@ -70,6 +73,9 @@ type record struct {
 	failures        []time.Time
 	quarantineUntil time.Time
 	gen             int
+	// lastErr is the most recent bind/unbind failure message, surfaced through
+	// proto.Device.LastError and cleared by a successful action or a reset.
+	lastErr string
 }
 
 // Reconciler owns all device state and performs every sysfs write.
@@ -269,6 +275,9 @@ func (r *Reconciler) planLocked(pin config.DeviceConfig, dev sysfs.Device, prese
 	if !present {
 		rec.state = Absent
 		rec.exportedAt = time.Time{}
+		// A device that is no longer attached has no current failure; do not
+		// keep reporting a stale last_error.
+		rec.lastErr = ""
 		return plannedAction{}, false
 	}
 
@@ -361,29 +370,37 @@ func (r *Reconciler) commitLocked(p *plannedAction, now time.Time) {
 	if p.release {
 		if p.err != nil {
 			r.warnf("unbind %s failed: %v", p.dev.BusID, p.err)
-			r.failLocked(p.pin, rec, now)
+			r.failLocked(p.pin, rec, now, p.err)
 			return
 		}
 		rec.gen = 0
 		rec.state = Present
 		rec.exportedAt = time.Time{}
+		rec.lastErr = ""
 		return
 	}
 
 	if p.err != nil {
 		r.warnf("bind %s failed: %v", p.dev.BusID, p.err)
-		r.failLocked(p.pin, rec, now)
+		r.failLocked(p.pin, rec, now, p.err)
 		return
 	}
 	rec.gen = p.dev.DevNum
 	rec.exportedAt = now
 	rec.state = Exported
+	rec.lastErr = ""
 }
 
 // failLocked records a bind/reset failure, grows the backoff, and trips the
 // quarantine circuit breaker when failures stack up inside the window. The
 // caller must hold r.mu.
-func (r *Reconciler) failLocked(pin string, rec *record, now time.Time) {
+func (r *Reconciler) failLocked(pin string, rec *record, now time.Time, err error) {
+	if err != nil {
+		// Store only a short, path-free reason: LastError is exposed through
+		// the API, SSE and the UI, and must not leak sysfs internals the way
+		// backendError deliberately avoids. The full error is logged above.
+		rec.lastErr = safeReason(err.Error())
+	}
 	rec.failures = append(rec.failures, now)
 	cut := now.Add(-failureWindow)
 	kept := rec.failures[:0]
@@ -421,6 +438,50 @@ func (r *Reconciler) failLocked(pin string, rec *record, now time.Time) {
 	r.warnf("pin %q failed, retrying in %s", pin, delay)
 }
 
+// safeReasonRe matches a path-like token anywhere in a message: a leading slash
+// at the start of the string or after a non-alphanumeric boundary, followed by
+// at least one path character. Matching anywhere, rather than only a
+// whitespace-delimited first field, catches quoted, delimited and embedded
+// paths such as `open "/sys/x"`, `(/sys/x)` or `path=/sys/x`.
+var safeReasonRe = regexp.MustCompile(`(^|[^[:alnum:]])/[^\s,;)"'\]}]+`)
+
+// safeReason reduces an internal bind/unbind error to a short reason that is
+// safe to expose through proto.Device.LastError (and therefore /v1/devices,
+// SSE and the UI). A message that names a filesystem path is replaced with a
+// stable generic reason, because such paths name sysfs internals; the full
+// error is still written to the log. A short, path-free message is preserved so
+// operators keep the useful part.
+func safeReason(msg string) string {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return "operation failed"
+	}
+	// Collapse control characters so a multi-line error cannot smuggle a
+	// second line into the field.
+	msg = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, msg)
+	if safeReasonRe.MatchString(msg) {
+		return "operation failed"
+	}
+	return truncateRunes(msg, 200)
+}
+
+// truncateRunes returns the longest prefix of s that is at most max bytes and
+// does not split a UTF-8 rune.
+func truncateRunes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
 // rebuildSnapshotLocked republishes the device snapshot and emits events for
 // every presence or state change. The caller must hold r.mu.
 func (r *Reconciler) rebuildSnapshotLocked(resolved map[string]sysfs.Device, now time.Time) {
@@ -435,7 +496,7 @@ func (r *Reconciler) rebuildSnapshotLocked(resolved map[string]sysfs.Device, now
 	for _, pin := range r.Pins {
 		rec := r.recordLocked(pin.Name)
 		dev, present := resolved[pin.Name]
-		pd := toProto(pin, rec.state, dev, present)
+		pd := toProto(pin, rec.state, rec.lastErr, dev, present)
 		snapshot = append(snapshot, pd)
 		if present {
 			bybusid[dev.BusID] = pin.Name
@@ -453,6 +514,12 @@ func (r *Reconciler) rebuildSnapshotLocked(resolved map[string]sysfs.Device, now
 			r.publishLocked(proto.Event{Type: typ, Device: pd, At: now})
 		}
 		if seen && prev.State != pd.State {
+			r.publishLocked(proto.Event{Type: proto.EventStateChanged, Device: pd, At: now})
+		}
+		// A changed error message without a state change is still a meaningful
+		// update for the UI, so raise state_changed for it too. The Windows
+		// supervisor ignores state_changed (see client.Manager.HandleEvent).
+		if seen && prev.State == pd.State && prev.LastError != pd.LastError {
 			r.publishLocked(proto.Event{Type: proto.EventStateChanged, Device: pd, At: now})
 		}
 	}
@@ -523,6 +590,7 @@ func (r *Reconciler) Reset(_ context.Context, id string) error {
 	rec.nextAttempt = time.Time{}
 	rec.failures = nil
 	rec.quarantineUntil = time.Time{}
+	rec.lastErr = ""
 	r.signal()
 	return nil
 }
@@ -629,16 +697,17 @@ func (r *Reconciler) resolvePinLocked(id string) (string, bool) {
 	return "", false
 }
 
-func toProto(pin config.DeviceConfig, st State, dev sysfs.Device, present bool) proto.Device {
+func toProto(pin config.DeviceConfig, st State, lastErr string, dev sysfs.Device, present bool) proto.Device {
 	mode := pin.Mode
 	if mode == "" {
 		mode = config.ModeOnDemand
 	}
 	pd := proto.Device{
-		Pin:     pin.Name,
-		Mode:    mode,
-		Present: present,
-		State:   stateToProto(st),
+		Pin:       pin.Name,
+		Mode:      mode,
+		Present:   present,
+		State:     stateToProto(st),
+		LastError: lastErr,
 	}
 	if present {
 		pd.BusID = dev.BusID

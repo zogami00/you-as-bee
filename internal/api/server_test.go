@@ -12,6 +12,7 @@ import (
 
 	"github.com/zogami00/you-as-bee/internal/config"
 	"github.com/zogami00/you-as-bee/internal/proto"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 type fakeBackend struct {
@@ -64,6 +65,7 @@ func newTestServer(t *testing.T) (*Server, *fakeBackend) {
 		Token:          testToken,
 		AllowedClients: []string{"10.0.0.0/8"},
 		Backend:        backend,
+		WebUI:          true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -233,14 +235,41 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEveryGuardedRouteRequiresToken enumerates the guarded routes from the
+// authedRequest sends a request with a cancelled context so streaming handlers
+// (/v1/events) return instead of blocking the test. It can set either a bearer
+// token, a session cookie, or both.
+func authedRequest(t *testing.T, srv *Server, method, target, remoteAddr, token, session string, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(method, target, nil).WithContext(ctx)
+	req.RemoteAddr = remoteAddr
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if session != "" {
+		req.AddCookie(&http.Cookie{Name: webui.SessionCookieName, Value: session})
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// TestEveryGuardedRouteRequiresToken enumerates the /v1 routes from the
 // server's registration table and asserts each rejects an unauthenticated
-// request, so a new route added without guard fails this test.
+// request, accepts a bearer token, and accepts a session cookie (plus the CSRF
+// header for writes). TestFrontDoorGuardsDirectlyRegisteredRoute additionally
+// covers a route registered directly on the mux.
 func TestEveryGuardedRouteRequiresToken(t *testing.T) {
 	srv, _ := newTestServer(t)
 	if len(srv.guardedRoutes) == 0 {
 		t.Fatal("no guarded routes registered")
 	}
+	session := srv.sessions.Create()
+	csrf := map[string]string{webui.CSRFHeader: webui.CSRFHeaderValue}
 	for _, route := range srv.guardedRoutes {
 		method, pattern, ok := strings.Cut(route, " ")
 		if !ok {
@@ -248,9 +277,135 @@ func TestEveryGuardedRouteRequiresToken(t *testing.T) {
 		}
 		path := strings.ReplaceAll(pattern, "{id}", "bt")
 		t.Run(route, func(t *testing.T) {
-			rec := request(t, srv, method, path, "10.0.0.5:1234", "", nil)
-			if rec.Code != http.StatusUnauthorized {
-				t.Errorf("status = %d, want 401", rec.Code)
+			if rec := request(t, srv, method, path, "10.0.0.5:1234", "", nil); rec.Code != http.StatusUnauthorized {
+				t.Errorf("no auth: status = %d, want 401", rec.Code)
+			}
+			if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", testToken, "", nil); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("bearer: status = %d, want accepted", rec.Code)
+			}
+
+			if method == http.MethodGet || method == http.MethodHead {
+				if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", "", session, nil); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+					t.Errorf("cookie GET: status = %d, want accepted", rec.Code)
+				}
+				return
+			}
+			// A session write without the CSRF header is refused...
+			if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", "", session, nil); rec.Code != http.StatusForbidden {
+				t.Errorf("cookie write without CSRF: status = %d, want 403", rec.Code)
+			}
+			// ...and accepted with it.
+			if rec := authedRequest(t, srv, method, path, "10.0.0.5:1234", "", session, csrf); rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
+				t.Errorf("cookie write with CSRF: status = %d, want accepted", rec.Code)
+			}
+		})
+	}
+}
+
+// routePath turns a registered "METHOD /pattern" into a concrete request path.
+func routePath(t *testing.T, pattern string) string {
+	t.Helper()
+	switch pattern {
+	case "/ui/":
+		return "/ui/"
+	case "/ui/assets/":
+		return "/ui/assets/app.css"
+	}
+	return strings.ReplaceAll(pattern, "{id}", "bt")
+}
+
+// TestEveryRegisteredRouteIsPublicOrAllowlisted enumerates the routes actually
+// registered on the mux (including the /ui/ routes) and asserts that every one
+// of them is either explicitly public (/healthz) or rejects a non-allowlisted
+// peer with 403. This is the invariant BLOCKER 1 violated: the /ui/ routes were
+// registered directly and skipped the allowlist.
+func TestEveryRegisteredRouteIsPublicOrAllowlisted(t *testing.T) {
+	srv, _ := newTestServer(t)
+	if len(srv.allRoutes) == 0 {
+		t.Fatal("no routes registered")
+	}
+	for _, route := range srv.allRoutes {
+		method, pattern, ok := strings.Cut(route, " ")
+		if !ok {
+			t.Fatalf("malformed route %q", route)
+		}
+		t.Run(route, func(t *testing.T) {
+			path := routePath(t, pattern)
+			rec := request(t, srv, method, path, "203.0.113.9:1234", "", nil)
+			if pattern == "/healthz" {
+				if rec.Code != http.StatusOK {
+					t.Fatalf("public /healthz from a disallowed peer = %d, want 200", rec.Code)
+				}
+				return
+			}
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("disallowed peer %s = %d, want 403", route, rec.Code)
+			}
+			if !isErrorCode(t, rec, "forbidden") {
+				t.Error("body did not carry the forbidden error code")
+			}
+		})
+	}
+}
+
+// TestFrontDoorGuardsDirectlyRegisteredRoute proves the front door, not each
+// handler, is what enforces the guard: a route registered directly on the mux
+// (as BLOCKER 1's /ui/ routes were) is still allowlist- and credential-checked.
+// The registration also goes through routeMux, so it is enumerated in
+// allRoutes: TestEveryRegisteredRouteIsPublicOrAllowlisted can no longer miss a
+// route that bypasses the registration table.
+func TestFrontDoorGuardsDirectlyRegisteredRoute(t *testing.T) {
+	srv, _ := newTestServer(t)
+	srv.mux.HandleFunc("GET /v1/directly-registered", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	enumerated := false
+	for _, route := range srv.allRoutes {
+		if route == "GET /v1/directly-registered" {
+			enumerated = true
+			break
+		}
+	}
+	if !enumerated {
+		t.Fatalf("a directly registered route was not enumerated in allRoutes: %v", srv.allRoutes)
+	}
+
+	if rec := request(t, srv, http.MethodGet, "/v1/directly-registered", "203.0.113.9:1234", "", nil); rec.Code != http.StatusForbidden {
+		t.Fatalf("disallowed peer = %d, want 403", rec.Code)
+	}
+	if rec := request(t, srv, http.MethodGet, "/v1/directly-registered", "10.0.0.5:1234", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated allowlisted peer = %d, want 401", rec.Code)
+	}
+	if rec := request(t, srv, http.MethodGet, "/v1/directly-registered", "10.0.0.5:1234", testToken, nil); rec.Code != http.StatusOK {
+		t.Fatalf("bearer = %d, want 200", rec.Code)
+	}
+}
+
+// TestHeadRequestsFollowGetPolicy: Go's ServeMux routes HEAD to a GET pattern,
+// so HEAD must obey the same allowlist and credential rules, including on the
+// pre-auth /ui/ routes.
+func TestHeadRequestsFollowGetPolicy(t *testing.T) {
+	srv, _ := newTestServer(t)
+	cases := []struct {
+		name       string
+		target     string
+		addr       string
+		token      string
+		wantStatus int
+	}{
+		{"api disallowed", "/v1/devices", "203.0.113.9:1234", "", http.StatusForbidden},
+		{"api unauthenticated", "/v1/devices", "10.0.0.5:1234", "", http.StatusUnauthorized},
+		{"api bearer", "/v1/devices", "10.0.0.5:1234", testToken, http.StatusOK},
+		{"healthz public", "/healthz", "203.0.113.9:1234", "", http.StatusOK},
+		{"ui disallowed", "/ui/login", "203.0.113.9:1234", "", http.StatusForbidden},
+		{"ui allowlisted", "/ui/login", "10.0.0.5:1234", "", http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := request(t, srv, http.MethodHead, tc.target, tc.addr, tc.token, nil)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("HEAD %s from %s = %d, want %d", tc.target, tc.addr, rec.Code, tc.wantStatus)
 			}
 		})
 	}
@@ -348,6 +503,31 @@ func TestBackendErrorHidesDetail(t *testing.T) {
 	}
 	if strings.Contains(e.Message, "/sys/") {
 		t.Errorf("error message leaked a path: %q", e.Message)
+	}
+}
+
+// TestRedactPathsOnlyMatchesPathLikeTokens: the redaction regex is anchored to
+// a leading slash at a word boundary, so it redacts paths wherever they appear
+// but leaves an ordinary slash used as a conjunction or in a ratio alone.
+func TestRedactPathsOnlyMatchesPathLikeTokens(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"/sys/bus/usb/devices/1-1.2", "[redacted]"},
+		{"write /sys/bus/usb/drivers/usbip-host/bind: permission denied", "write [redacted] permission denied"},
+		{`open "/sys/x" failed`, `open "[redacted]" failed`},
+		{"path=/sys/x", "path=[redacted]"},
+		{"(/sys/x)", "([redacted])"},
+		{"and/or", "and/or"},
+		{"24/7 uptime", "24/7 uptime"},
+		{"read/write mix", "read/write mix"},
+		{"no slash here", "no slash here"},
+	}
+	for _, tc := range cases {
+		if got := redactPaths(tc.in); got != tc.want {
+			t.Errorf("redactPaths(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

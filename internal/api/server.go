@@ -10,10 +10,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/zogami00/you-as-bee/internal/proto"
+	"github.com/zogami00/you-as-bee/internal/webui"
 )
 
 // Backend is the device state the API exposes. It is implemented by the
@@ -43,6 +46,13 @@ type Config struct {
 	UnknownErr error
 	// Log receives request errors. May be nil.
 	Log *slog.Logger
+	// WebUI enables the embedded browser UI and session-cookie auth on /ui/.
+	// It is opt-in (agent config web_ui), so the bearer-token surface is
+	// unchanged when it is false.
+	WebUI bool
+	// Logs, when non-nil, is served by GET /v1/logs. It is the same ring the
+	// process logger fans out to.
+	Logs *webui.LogRing
 }
 
 // Server is the management HTTP server.
@@ -52,13 +62,60 @@ type Server struct {
 	backend    Backend
 	unknownErr error
 	log        *slog.Logger
-	mux        *http.ServeMux
-	// guardedRoutes records every route registered with guard, as
-	// "METHOD /pattern". Tests enumerate it so a new guarded route cannot be
-	// added without being covered; every entry in the registration table below
-	// is guarded.
+	webUI      bool
+	logs       *webui.LogRing
+	sessions   *webui.Sessions
+	// codes is retained for the Windows client's login flow in the next
+	// milestone. The Pi login flow no longer issues or redeems a one-time code
+	// (the token in the form is sufficient and the code was a flood vector), so
+	// nothing in this binary calls Issue or Redeem. The table is bounded.
+	codes   *webui.OneTimeCodes
+	login   *loginLimiter
+	mux     *routeMux
+	handler http.Handler
+	// guardedRoutes records every /v1 route, as "METHOD /pattern". Tests
+	// enumerate it so a new guarded route cannot be added without being
+	// covered.
 	guardedRoutes []string
-	http          *http.Server
+	// allRoutes records every pattern registered on the mux, including the
+	// public and UI routes, as "METHOD /pattern". It is populated by routeMux
+	// on every registration, not maintained by hand, so tests enumerate the
+	// routes that are actually registered.
+	allRoutes []string
+	http      *http.Server
+}
+
+// routeMux is the mux registration path for the API. Every pattern registered
+// through Handle or HandleFunc is appended to routes, so
+// TestEveryRegisteredRouteIsPublicOrAllowlisted enumerates the routes that are
+// actually registered rather than a hand-maintained list. The underlying
+// http.ServeMux is unexported and reachable only through Handle/HandleFunc, so
+// the normal way to add a route also records it.
+type routeMux struct {
+	inner  *http.ServeMux
+	routes *[]string
+}
+
+// newRouteMux returns a routeMux that records each registered pattern in
+// routes.
+func newRouteMux(routes *[]string) *routeMux {
+	return &routeMux{inner: http.NewServeMux(), routes: routes}
+}
+
+// Handle registers pattern and records it.
+func (m *routeMux) Handle(pattern string, handler http.Handler) {
+	m.inner.Handle(pattern, handler)
+	*m.routes = append(*m.routes, pattern)
+}
+
+// HandleFunc registers pattern and records it.
+func (m *routeMux) HandleFunc(pattern string, handler http.HandlerFunc) {
+	m.Handle(pattern, handler)
+}
+
+// ServeHTTP implements http.Handler.
+func (m *routeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	m.inner.ServeHTTP(w, r)
 }
 
 // New builds a Server from cfg.
@@ -68,8 +125,13 @@ func New(cfg Config) (*Server, error) {
 		backend:    cfg.Backend,
 		unknownErr: cfg.UnknownErr,
 		log:        cfg.Log,
-		mux:        http.NewServeMux(),
+		webUI:      cfg.WebUI,
+		logs:       cfg.Logs,
+		sessions:   webui.NewSessions(),
+		codes:      webui.NewOneTimeCodes(),
+		login:      newLoginLimiter(),
 	}
+	s.mux = newRouteMux(&s.allRoutes)
 	for _, cidr := range cfg.AllowedClients {
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
@@ -80,9 +142,10 @@ func New(cfg Config) (*Server, error) {
 
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	// Every guarded route is registered from this table, which is also what
-	// TestEveryGuardedRouteRequiresToken enumerates. Registering here with
-	// s.guard is the only way to add a route under /v1/, so a new route is
-	// guarded and covered by construction.
+	// TestEveryGuardedRouteRequiresToken enumerates. The handlers are not
+	// wrapped individually: the front door (see frontDoor) applies guard to
+	// every request that is not /healthz or under /ui/, so a route added to
+	// the mux is guarded even if it is added here by mistake.
 	guarded := []struct {
 		method  string
 		pattern string
@@ -95,20 +158,45 @@ func New(cfg Config) (*Server, error) {
 		{http.MethodPost, "/v1/devices/{id}/unexport", s.handleUnexport},
 		{http.MethodPost, "/v1/devices/{id}/reset", s.handleReset},
 		{http.MethodGet, "/v1/events", s.handleEvents},
+		{http.MethodGet, "/v1/logs", s.handleLogs},
 	}
 	for _, rt := range guarded {
 		pattern := rt.method + " " + rt.pattern
-		s.mux.Handle(pattern, s.guard(rt.handler))
+		s.mux.Handle(pattern, rt.handler)
 		s.guardedRoutes = append(s.guardedRoutes, pattern)
+	}
+
+	if cfg.WebUI {
+		// The login page, logout and the assets are pre-authentication: a
+		// browser has no token, it logs in with the token to obtain a session
+		// cookie. They are still behind the CIDR allowlist (the front door
+		// applies it to every /ui/ path), because provision.sh --no-firewall
+		// can leave port 3241 open and the allowlist is the application-layer
+		// fence. The shell is gated on the session inside the handler so an
+		// unauthenticated visitor is redirected to the form.
+		ui := []struct {
+			pattern string
+			handler http.Handler
+		}{
+			{"GET /ui/login", http.HandlerFunc(s.handleLoginForm)},
+			{"POST /ui/login", http.HandlerFunc(s.handleLoginSubmit)},
+			{"POST /ui/logout", http.HandlerFunc(s.handleLogout)},
+			{"GET /ui/", http.HandlerFunc(s.handleUIIndex)},
+			{"GET /ui/assets/", http.StripPrefix("/ui/assets/", webui.StaticHandler())},
+		}
+		for _, rt := range ui {
+			s.mux.Handle(rt.pattern, rt.handler)
+		}
 	}
 
 	addr := cfg.Listen
 	if addr == "" {
 		addr = "0.0.0.0:3241"
 	}
+	s.handler = s.frontDoor(s.mux)
 	s.http = &http.Server{
 		Addr:              addr,
-		Handler:           s.mux,
+		Handler:           s.handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -119,7 +207,7 @@ func New(cfg Config) (*Server, error) {
 }
 
 // Handler returns the HTTP handler, primarily for tests.
-func (s *Server) Handler() http.Handler { return s.mux }
+func (s *Server) Handler() http.Handler { return s.handler }
 
 // ListenAndServe blocks serving the API.
 func (s *Server) ListenAndServe() error { return s.http.ListenAndServe() }
@@ -127,17 +215,103 @@ func (s *Server) ListenAndServe() error { return s.http.ListenAndServe() }
 // Shutdown stops the server gracefully.
 func (s *Server) Shutdown(ctx context.Context) error { return s.http.Shutdown(ctx) }
 
-// guard enforces the source allowlist and the bearer token. /healthz is the
-// only route registered without guard.
+// uiCSP is the Content-Security-Policy applied to every /ui/ response. The
+// embedded assets are external files (app.css, app.js) with no inline script or
+// style, so no 'unsafe-inline' is needed. connect-src 'self' allows the fetch
+// and EventSource calls the shell makes to /v1/. frame-ancestors 'none' plus
+// X-Frame-Options stop the UI (which carries the destructive Reset and Force
+// controls) being framed or clickjacked.
+const uiCSP = "default-src 'none'; script-src 'self'; style-src 'self'; " +
+	"img-src 'self'; connect-src 'self'; base-uri 'none'; " +
+	"form-action 'self'; frame-ancestors 'none'"
+
+// frontDoor is the single place every request is classified, so a newly added
+// route cannot accidentally escape the allowlist or the credential check:
+//
+//   - /healthz is the only public route (no allowlist, no credentials) so a
+//     client can distinguish "unreachable" from "not allowed".
+//   - every /ui/ path is behind the CIDR allowlist (allowOnly) and carries the
+//     browser hardening headers; the pre-auth login routes must not skip the
+//     allowlist, or provision.sh --no-firewall leaves them exposed.
+//   - everything else goes through guard (allowlist + bearer token or session
+//     cookie), so a route registered directly on the mux is still guarded.
+func (s *Server) frontDoor(next http.Handler) http.Handler {
+	// The hardening headers are applied outermost so that every /ui/ response
+	// carries them, including the 403 allowOnly writes for a disallowed peer
+	// and any other error response.
+	ui := uiSecurityHeaders(s.allowOnly(next))
+	guarded := s.guard(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/healthz":
+			next.ServeHTTP(w, r)
+		case r.URL.Path == "/ui" || strings.HasPrefix(r.URL.Path, "/ui/"):
+			ui.ServeHTTP(w, r)
+		default:
+			guarded.ServeHTTP(w, r)
+		}
+	})
+}
+
+// allowOnly enforces just the CIDR allowlist, for the pre-authentication /ui/
+// routes that authenticate with a session rather than a bearer token.
+func (s *Server) allowOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.allowlisted(r) {
+			writeError(w, http.StatusForbidden, "forbidden", "client address is not allowed")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// uiSecurityHeaders adds the browser hardening headers to a /ui/ response.
+func uiSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", uiCSP)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// guard enforces the source allowlist and authentication. A request passes
+// when its peer is allowlisted and it presents either a valid bearer token or a
+// valid session cookie (the latter with the CSRF header on writes). /healthz is
+// the only route registered without guard.
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.allowlisted(r) {
 			writeError(w, http.StatusForbidden, "forbidden", "client address is not allowed")
 			return
 		}
-		if !s.tokenOK(r) {
-			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid bearer token")
+		if s.tokenOK(r) {
+			// A bearer client is unchanged: no CSRF requirement.
+			next.ServeHTTP(w, r)
 			return
+		}
+		id, ok := s.sessionID(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "missing or invalid credentials")
+			return
+		}
+		// Slide the browser cookie's Max-Age with every session-authenticated
+		// request so it matches the idle TTL the server actually enforces,
+		// instead of expiring 12h after login while the session is still live.
+		webui.SetCookie(w, id, webui.SessionTTL)
+		if !isReadMethod(r.Method) {
+			// A session authenticates a write only with the CSRF header; a
+			// missing header is a forbidden request, not an unauthenticated one.
+			if r.Header.Get(webui.CSRFHeader) != webui.CSRFHeaderValue {
+				writeError(w, http.StatusForbidden, "forbidden", "missing CSRF header")
+				return
+			}
+			if !sameOrigin(r) {
+				writeError(w, http.StatusForbidden, "forbidden", "cross-origin request refused")
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -194,6 +368,12 @@ func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// sessionPollInterval is how often an open /v1/events stream re-checks that its
+// authenticating session is still alive. Watch already closes the stream when a
+// session is deleted or evicted; this catches idle expiry, which nothing else
+// observes while the stream is open.
+const sessionPollInterval = time.Minute
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -211,16 +391,48 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// A session-authenticated browser must stop receiving events as soon as its
+	// session ends. Watch closes immediately on logout or eviction; the ticker
+	// catches idle expiry, which nothing else observes while the stream is open
+	// (serving the stream is not session activity).
+	var sessionID string
+	var sessionDone <-chan struct{}
+	if !s.tokenOK(r) {
+		// Reaching here means guard authenticated this request with a session
+		// cookie rather than a bearer token. Watch must confirm the session
+		// before the stream starts: if the session was deleted or evicted
+		// between guard's Validate and now, streaming with no watcher would
+		// keep delivering events to an ended session until the client
+		// disconnects.
+		cookie, err := r.Cookie(webui.SessionCookieName)
+		if err != nil || cookie.Value == "" {
+			return
+		}
+		done, ok := s.sessions.Watch(cookie.Value)
+		if !ok {
+			return
+		}
+		sessionID, sessionDone = cookie.Value, done
+	}
+
 	events, cancel := s.backend.Subscribe(r.Context())
 	defer cancel()
 
 	keepAlive := time.NewTicker(20 * time.Second)
 	defer keepAlive.Stop()
+	sessionCheck := time.NewTicker(sessionPollInterval)
+	defer sessionCheck.Stop()
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-sessionDone:
+			return
+		case <-sessionCheck.C:
+			if sessionID != "" && !s.sessions.Alive(sessionID) {
+				return
+			}
 		case ev, open := <-events:
 			if !open {
 				return
@@ -232,6 +444,82 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// handleLogs serves GET /v1/logs, the recent structured log records.
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	after, _ := strconv.ParseUint(r.URL.Query().Get("after"), 10, 64)
+	limit := webui.DefaultLogsLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "bad_request", "limit must be an integer between 1 and 500")
+			return
+		}
+		if n > webui.MaxLogsLimit {
+			n = webui.MaxLogsLimit
+		}
+		limit = n
+	}
+	if s.logs == nil {
+		writeJSON(w, http.StatusOK, proto.LogsResponse{Entries: []proto.LogEntry{}, Next: after})
+		return
+	}
+	resp := s.logs.Entries(after, limit)
+	// The ring mirrors the process log, which can name sysfs paths (for
+	// example a failed bind's write target). backendError deliberately redacts
+	// exactly that detail, so redact it here too. The console/journald copy is
+	// untouched.
+	//
+	// Entries returns each entry's Attrs map by reference, so the ring's map is
+	// shared with this response. Redact into a fresh map rather than writing
+	// through the shared one: a concurrent /v1/logs request doing the same
+	// would be a concurrent map write, which Go aborts the whole process on.
+	for i := range resp.Entries {
+		resp.Entries[i].Msg = redactPaths(resp.Entries[i].Msg)
+		resp.Entries[i].Attrs = redactAttrs(resp.Entries[i].Attrs)
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// pathTokenRe matches a path-like token: a leading slash that is at the start
+// of the string or follows a non-alphanumeric boundary, followed by at least
+// one path character. Anchoring the leading slash is what keeps a bare slash
+// used as a conjunction ("and/or", "24/7") from being mangled.
+var pathTokenRe = regexp.MustCompile(`(^|[^[:alnum:]])/[^\s,;)"'\]}]+`)
+
+// redactPaths replaces path-like tokens with a fixed marker. It returns s
+// unchanged when no token changes.
+func redactPaths(s string) string {
+	if !strings.Contains(s, "/") {
+		return s
+	}
+	return pathTokenRe.ReplaceAllString(s, "${1}[redacted]")
+}
+
+// redactAttrs returns a map with every value redacted, or the input map
+// unchanged when no value changes. It never mutates the input map: that map is
+// owned by the log ring and may be read concurrently by other /v1/logs
+// requests.
+func redactAttrs(attrs map[string]string) map[string]string {
+	if len(attrs) == 0 {
+		return attrs
+	}
+	changed := false
+	for _, v := range attrs {
+		if redactPaths(v) != v {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return attrs
+	}
+	redacted := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		redacted[k] = redactPaths(v)
+	}
+	return redacted
 }
 
 func (s *Server) backendError(w http.ResponseWriter, err error) {

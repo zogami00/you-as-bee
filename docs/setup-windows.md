@@ -120,7 +120,35 @@ to a vhci port requires administrator rights. The task is registered with an
 unlimited execution-time limit, starts on battery, and `StartWhenAvailable`, so
 it is not silently killed after 72 hours.
 
-## 7. Tray, quitting and removal
+## 7. The local browser UI
+
+`yab tray` serves a small browser UI that shows each pin's state and offers
+**Attach** and **Detach**, plus a server-reachability panel and the recent
+client log records. Open it from the tray menu: **Open web UI**.
+
+- The UI is **loopback only**. It binds `web_ui.listen` (default
+  `127.0.0.1:0`, where `0` means the OS picks a free port) and refuses any
+  non-loopback host, so it cannot be reached from another machine. There is no
+  Windows firewall rule to add.
+- A **one-time code** does the authentication. The tray mints a code, opens
+  `http://127.0.0.1:<port>/ui/login?code=...` through `explorer.exe` (so the
+  browser starts de-elevated even though the tray runs elevated) and the code is
+  bound to that browser. It is single-use and expires after 60 seconds; the code
+  leaves the URL as soon as it is redeemed.
+- The browser **never receives the Pi token**. It holds only an
+  `HttpOnly; SameSite=Strict` session cookie for the local server, and the
+  loopback server talks to the Pi on the browser's behalf. See
+  [architecture.md](architecture.md).
+- Set `"web_ui": { "enabled": false }` in `client.json` to disable it. Logging
+  in requires the tray (and therefore an elevated process) to be running.
+
+**Upgrade hazard.** The client config loader rejects unknown fields. If you roll
+`yab.exe` back to a version older than the one that introduced `web_ui`, delete
+the `"web_ui"` block from `%ProgramData%\you-as-bee\client.json` first, or the
+older binary fails to start. The new default is enabled, so removing the key
+does not disable the UI on the current version.
+
+## 8. Tray, quitting and removal
 
 - The tray menu shows each pin's state and, when relevant, the last attach
   error or the pause reason (for example "device was detached outside usbip").
