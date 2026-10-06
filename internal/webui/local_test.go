@@ -330,6 +330,63 @@ func TestLocalLoginCodeExpiry(t *testing.T) {
 	}
 }
 
+// TestNewLoginURLHasNoQuery guards against regressing the tray's browser
+// launch: explorer.exe treats a URL containing "?" as a filesystem path, opens
+// a folder window and launches no browser, so the one-time code must live in a
+// path segment.
+func TestNewLoginURLHasNoQuery(t *testing.T) {
+	s, _ := startLocal(t, &fakeBackend{}, nil)
+	loginURL := s.NewLoginURL()
+	if strings.Contains(loginURL, "?") {
+		t.Fatalf("NewLoginURL contains a query string: %q", loginURL)
+	}
+	if !strings.HasPrefix(loginURL, s.BaseURL()+"/ui/login/") {
+		t.Fatalf("NewLoginURL = %q, want %s/ui/login/<code>", loginURL, s.BaseURL())
+	}
+}
+
+// TestLocalLoginPathForm: GET /ui/login/<code> behaves exactly like the query
+// form. It binds the code to the browser, only that browser may redeem it with
+// the same single-use code, and redemption 303-redirects to the shell (so the
+// code leaves the address bar).
+func TestLocalLoginPathForm(t *testing.T) {
+	b := &fakeBackend{}
+	s, ts := startLocal(t, b, nil)
+
+	code := s.codes.Issue()
+	owner := newTestClient()
+	resp := doGET(t, owner, ts.URL+"/ui/login/"+code)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("path issuing GET = %d, want 200", resp.StatusCode)
+	}
+
+	// A different client has no binding cookie and must not be able to redeem.
+	thief := newTestClient()
+	denied := doPOST(t, thief, ts.URL+"/ui/login", url.Values{"code": {code}}, nil)
+	denied.Body.Close()
+	if denied.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unbound path redemption = %d, want 401", denied.StatusCode)
+	}
+
+	// The owner can still redeem, and the redirect drops the code.
+	ok := doPOST(t, owner, ts.URL+"/ui/login", url.Values{"code": {code}}, nil)
+	ok.Body.Close()
+	if ok.StatusCode != http.StatusSeeOther {
+		t.Fatalf("bound path redemption = %d, want 303", ok.StatusCode)
+	}
+	if loc := ok.Header.Get("Location"); loc != "/ui/" {
+		t.Fatalf("path redemption Location = %q, want /ui/", loc)
+	}
+
+	// Single use.
+	again := doPOST(t, owner, ts.URL+"/ui/login", url.Values{"code": {code}}, nil)
+	again.Body.Close()
+	if again.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("second path redemption = %d, want 401", again.StatusCode)
+	}
+}
+
 // TestLocalLoginCookieIsHardened: the binding cookie is HttpOnly and
 // SameSite=Strict.
 func TestLocalLoginCookieIsHardened(t *testing.T) {

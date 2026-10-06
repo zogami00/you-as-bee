@@ -191,7 +191,13 @@ func NewLocal(cfg LocalConfig) (*LocalServer, error) {
 	}
 
 	mux := http.NewServeMux()
-	// Pre-authentication: the login form and the embedded assets.
+	// Pre-authentication: the login form and the embedded assets. The code is
+	// carried in a path segment (GET /ui/login/<code>) so the URL the tray
+	// opens is query-free: explorer.exe, which the elevated tray uses to start
+	// the browser de-elevated, treats a URL containing "?" as a filesystem
+	// path and opens a folder window instead of the browser. The ?code= form
+	// is kept for compatibility with anything that already knows it.
+	mux.HandleFunc("GET /ui/login/{code}", s.handleLoginForm)
 	mux.HandleFunc("GET /ui/login", s.handleLoginForm)
 	mux.HandleFunc("POST /ui/login", s.handleLoginSubmit)
 	mux.Handle("GET /ui/assets/", http.StripPrefix("/ui/assets/", StaticHandler()))
@@ -263,8 +269,15 @@ func (s *LocalServer) BaseURL() string { return "http://" + s.Addr() }
 // NewLoginURL issues a fresh one-time code and returns the URL the tray should
 // open. The code leaves the URL as soon as the browser redeems it, which
 // 303-redirects to the shell.
+//
+// The code is carried in a path segment, not a query string, because the
+// elevated tray opens this URL with explorer.exe to start the browser
+// de-elevated, and explorer.exe treats a URL containing "?" as a filesystem
+// path: it launches no browser and opens a folder window instead. The code is
+// hex from crypto/rand, so it is safe in a path segment. Do not reintroduce a
+// query string here.
 func (s *LocalServer) NewLoginURL() string {
-	return s.BaseURL() + "/ui/login?code=" + url.QueryEscape(s.codes.Issue())
+	return s.BaseURL() + "/ui/login/" + s.codes.Issue()
 }
 
 // state assembles the payload served by GET /ui/api/state.
@@ -389,11 +402,17 @@ func (s *LocalServer) unauthorized(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLoginForm issues the browser binding for a one-time code. The tray
-// creates the code and opens /ui/login?code=...; this GET sets the binding
-// cookie and renders the confirm page. The code is not redeemed here, so a code
-// that is copied out of the URL cannot be redeemed from another browser.
+// creates the code and opens /ui/login/<code>; this GET sets the binding
+// cookie and renders the confirm page. The ?code= query form is accepted too.
+// The code is not redeemed here, so a code that is copied out of the URL
+// cannot be redeemed from another browser.
 func (s *LocalServer) handleLoginForm(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
+	// Path form first: that is what NewLoginURL emits. A query string is
+	// accepted for compatibility, but never combined with explorer.exe.
+	code := r.PathValue("code")
+	if code == "" {
+		code = r.URL.Query().Get("code")
+	}
 	if code == "" {
 		_ = RenderLogin(w, LoginPage{Local: true, Error: "Open this page from the tray menu: Open web UI."}, http.StatusOK)
 		return

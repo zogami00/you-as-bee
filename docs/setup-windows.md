@@ -131,10 +131,15 @@ client log records. Open it from the tray menu: **Open web UI**.
   non-loopback host, so it cannot be reached from another machine. There is no
   Windows firewall rule to add.
 - A **one-time code** does the authentication. The tray mints a code, opens
-  `http://127.0.0.1:<port>/ui/login?code=...` through `explorer.exe` (so the
+  `http://127.0.0.1:<port>/ui/login/<code>` through `explorer.exe` (so the
   browser starts de-elevated even though the tray runs elevated) and the code is
   bound to that browser. It is single-use and expires after 60 seconds; the code
-  leaves the URL as soon as it is redeemed.
+  leaves the URL as soon as it is redeemed. The code is a **path segment, not a
+  query string**, on purpose: `explorer.exe` treats a URL containing `?` as a
+  filesystem path, launches no browser and opens a folder window instead.
+  (`explorer.exe` failing is detected, and the tray then falls back to
+  `rundll32.exe url.dll,FileProtocolHandler`, which may launch the browser
+  elevated.)
 - The browser **never receives the Pi token**. It holds only an
   `HttpOnly; SameSite=Strict` session cookie for the local server, and the
   loopback server talks to the Pi on the browser's behalf. See

@@ -108,7 +108,16 @@ func TestOpenUIFailureDoesNotLeakLoginCode(t *testing.T) {
 	if perr != nil {
 		t.Fatalf("parse launched URL %q: %v", launched, perr)
 	}
-	code := u.Query().Get("code")
+	// The code must be a path segment, not a query value: explorer.exe rejects
+	// a URL containing "?" and opens a folder instead of the browser.
+	if u.RawQuery != "" {
+		t.Errorf("the login URL carries a query string: %q", launched)
+	}
+	const codePrefix = "/ui/login/"
+	if !strings.HasPrefix(u.Path, codePrefix) {
+		t.Fatalf("launchBrowser was not called with a path code URL: %q", launched)
+	}
+	code := strings.TrimPrefix(u.Path, codePrefix)
 	if code == "" {
 		t.Fatalf("launchBrowser was not called with a code URL: %q", launched)
 	}
@@ -147,6 +156,24 @@ func TestExplorerPathIsAbsolute(t *testing.T) {
 	got = explorerPath()
 	if !filepath.IsAbs(got) || !strings.HasSuffix(strings.ToLower(got), "explorer.exe") {
 		t.Errorf("explorerPath() with an empty SystemRoot = %q, want an absolute path ending in explorer.exe", got)
+	}
+}
+
+func TestRundll32PathIsAbsolute(t *testing.T) {
+	t.Setenv("SystemRoot", `D:\Windows`)
+	got := rundll32Path()
+	want := filepath.Join(`D:\Windows`, "System32", "rundll32.exe")
+	if got != want {
+		t.Errorf("rundll32Path() = %q, want %q", got, want)
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("rundll32Path() = %q, want an absolute path", got)
+	}
+
+	t.Setenv("SystemRoot", "")
+	got = rundll32Path()
+	if !filepath.IsAbs(got) || !strings.HasSuffix(strings.ToLower(got), "rundll32.exe") {
+		t.Errorf("rundll32Path() with an empty SystemRoot = %q, want an absolute path ending in rundll32.exe", got)
 	}
 }
 
@@ -204,7 +231,11 @@ func TestWebUIHTTPNeverExposesToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse login URL: %v", err)
 	}
-	code := u.Query().Get("code")
+	const codePrefix = "/ui/login/"
+	if u.RawQuery != "" || !strings.HasPrefix(u.Path, codePrefix) {
+		t.Fatalf("NewLoginURL must use the query-free path form: %q", loginURL)
+	}
+	code := strings.TrimPrefix(u.Path, codePrefix)
 	if code == "" {
 		t.Fatalf("NewLoginURL carried no code: %q", loginURL)
 	}

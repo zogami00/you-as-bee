@@ -97,6 +97,11 @@ not a second supervisor:
   the browser that loaded it; redeeming it (a `303`) sets an
   `HttpOnly; SameSite=Strict` session cookie and leaves the code out of the URL.
   Session writes require `X-YAB-CSRF: 1`.
+- The code travels as a **path segment** (`GET /ui/login/<code>`), never a query
+  string. `explorer.exe` rejects a URL containing `?` and opens a folder instead
+  of the browser, which would break the de-elevated launch. `NewLoginURL` has a
+  test asserting the URL stays query-free; when `explorer.exe` nevertheless
+  fails, the launcher falls back to `rundll32.exe url.dll,FileProtocolHandler`.
 - **The browser never sees a Pi token.** The local server's payload types carry
   no credential; `Attach`/`Detach` are forwarded in-process to the same
   supervisor methods the tray menu calls, so the loopback server talks to the Pi
