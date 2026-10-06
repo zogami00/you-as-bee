@@ -71,6 +71,47 @@ directory (including the `yabd` binary) and run:
 sudo ./provision.sh --binary ./yabd-linux-arm64 --client-cidr 192.168.1.0/24
 ```
 
+### One-line bootstrap (`curl | sudo bash`)
+
+`deploy/pi/install.sh` is a small bootstrap for exactly that: it fetches the
+deployment bundle, then hands off to `provision.sh` (it never duplicates the
+provisioning logic). Cut a release first with `scripts\release.ps1`, or point it
+at any bundle host.
+
+```bash
+# From a release asset. The repository is private, so a token is required:
+curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+  https://github.com/zogami00/you-as-bee/releases/download/v1.0.0/install.sh \
+  | sudo bash -s -- --release v1.0.0 --token "$GITHUB_TOKEN"
+```
+
+What it does:
+
+- **Detects the architecture** and picks the matching binary: `aarch64`/`arm64`
+  -> `yabd-linux-arm64`; `armv7l`/`armhf` -> `yabd-linux-armv7`. Anything else
+  is refused with a clear message.
+- **Obtains the bundle** from, in order of preference: a local checkout (when
+  the script's directory, or `../../dist`, has `provision.sh` and the binary),
+  `--url <bundle-url>`, or a GitHub release (`--release [TAG]`, defaulting to
+  the latest release).
+- **Handles being piped.** When `BASH_SOURCE` is not a file (the `curl | sudo
+  bash` case) it fetches everything into a temporary directory and removes it
+  on exit.
+- **Passes through** `--client-cidr`, `--no-firewall`, `--binary` and
+  `--example` to `provision.sh`.
+- **Never prints the token.** For a private repository the GitHub token is
+  written to a mode-`0600` `curl` config file in the temporary directory, so it
+  does not appear on the command line or in the log.
+
+**Private-repo caveat.** GitHub serves a private release only to an
+authenticated request, so `--release` needs `--token <token>` or
+`$GITHUB_TOKEN` with `repo` scope. Without one, the API answers `404` and the
+bootstrap fails with a download error. A public bundle host (`--url`) needs no
+token.
+
+It is idempotent, because `provision.sh` is: a second run reports `provision: no
+changes` and does not reprint the token.
+
 ### What provisioning does
 
 1. **Preflight** - root, Raspberry Pi OS bookworm, `modprobe usbip-host`

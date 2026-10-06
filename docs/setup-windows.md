@@ -69,16 +69,62 @@ cd deploy\windows
 - reports whether `usbip.exe` was found and its version;
 - optionally verifies a `usbip-win2` archive SHA-256;
 - **reports** test-signing and Secure Boot state and changes neither;
-- copies `yab.exe` to `%ProgramFiles%\you-as-bee\yab.exe` (stopping a running
-  tray first so the locked binary can be replaced);
+- copies **both** `yab.exe` and `yabw.exe` to `%ProgramFiles%\you-as-bee\`
+  (stopping a running tray first so the locked binaries can be replaced);
 - creates `%ProgramData%\you-as-bee` and restricts it to Administrators and
   SYSTEM **before** writing the token-bearing config;
 - writes `%ProgramData%\you-as-bee\client.json` from `client.example.json`;
-- registers a highest-privilege logon Scheduled Task running `yab.exe tray`,
+- registers a highest-privilege logon Scheduled Task running `yabw.exe tray`,
   with an unlimited execution-time limit and battery-friendly settings.
 
-It supports `-WhatIf` (safe without elevation) and is idempotent. If you omit
-`-PiHost`/`-Token`, edit the config afterwards.
+It supports `-WhatIf` (safe without elevation) and is idempotent: a second run
+changes nothing and reports `Install complete: no changes were needed.` If you
+omit `-PiHost`/`-Token`, edit the config afterwards.
+
+### Why there are two binaries
+
+`cmd/yab` is one program that is both the tray and the CLI. Compiled normally
+it is a **console** binary, so starting the tray (`yab.exe tray`) opens a black
+console window and closing that window kills the tray. `yabw.exe` is the **same
+package built a second time** with `-ldflags "-H windowsgui"` (Go's GUI
+subsystem), so Windows gives it no console at all. There is no code
+duplication and nothing to keep in sync: it is the identical main package.
+
+- `yab.exe` stays a console binary and is what you type into a prompt: `yab
+  list`, `yab status`, `yab doctor`, `yab attach`, ...
+- `yabw.exe` is the **tray only**. Because it has no console, its CLI
+  subcommands have nowhere to print: `yabw.exe list` runs but produces no
+  visible output. Launch it with no arguments (or `tray`) and use `yab.exe` for
+  everything else.
+- The logon task runs `yabw.exe tray`, so logon no longer flashes a console.
+
+To migrate an existing install whose task still runs `yab.exe`, re-run
+`install.ps1 -Force` (the task name is unchanged, so a plain re-run keeps the
+old action).
+
+### Installer source modes
+
+`install.ps1` can get the binaries from three places, in this order of
+preference:
+
+1. **Local bundle** (default): `-BundleDir <dir>`, or the script's own
+   directory when it already contains `yab.exe` and `yabw.exe`. This is what a
+   packaged release looks like - no checkout, no `dist\` layout.
+2. **Download**: `-BundleUrl <base-url>` fetches `<base-url>/yab.exe`,
+   `<base-url>/yabw.exe` and `<base-url>/client.example.json` to a temporary
+   directory. For a private host pass `-BundleToken <token>`; the token is sent
+   as `Authorization: Bearer <token>` and is never written to disk. Every
+   download must be non-empty and each binary must have a valid PE header
+   (`MZ` plus a `PE\0\0` signature), so an HTML error page saved as `yab.exe`
+   is rejected before anything reaches `%ProgramFiles%`.
+3. **Legacy checkout layout**: `-SourcePath` (default
+   `..\..\dist\yab-windows-amd64.exe`), with `yabw-windows-amd64.exe` expected
+   beside it. This preserves the previous behaviour for a working copy.
+
+`-WhatIf` works in all three modes. In download mode it still fetches the
+bundle into a temporary directory (so the URL and the file headers are
+validated) but changes nothing on the system; the temporary directory is always
+removed.
 
 `%ProgramData%\you-as-bee` is restricted to Administrators and SYSTEM because
 `client.json` holds the bearer token. Every `yab` command reads that file, so

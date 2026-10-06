@@ -82,6 +82,21 @@ current `yab` always attaches with `--once` it starts no retries of its own, so
 in normal operation the call is a no-op; the side effect only bites when another
 usbip-win2 user or an older `yab` left a retry running.
 
+## Why the tray is a separate windowless build
+
+The Windows client ships as two files built from the same `cmd/yab` package.
+`yab.exe` is an ordinary console binary: running `yab list`, `yab status` or
+`yab doctor` must print to the prompt, and the tool is used interactively. The
+tray, however, is started by a logon Scheduled Task with no one watching the
+console. A console binary started that way flashes a black window and dies with
+it, so the tray is built a second time with `-H windowsgui` as `yabw.exe`. Go's
+linker switches the PE subsystem from console (3) to GUI (2), which tells
+Windows not to allocate a console. It is the identical main package - no code
+is duplicated and there is no wrapper process - so the only difference between
+the two binaries is the subsystem field in the PE header. The installer
+registers the logon task against `yabw.exe tray` and keeps `yab.exe` for the
+CLI.
+
 ## Windows local web UI
 
 `yab tray` can serve the same embedded shell (`internal/webui/assets`) from a
